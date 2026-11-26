@@ -3,7 +3,6 @@ package securitykey_test
 import (
 	"bytes"
 	"crypto/ecdsa"
-	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha512"
@@ -11,9 +10,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
-	"fmt"
 	"math/big"
-	"net"
 	"os"
 	"os/exec"
 	"os/user"
@@ -26,6 +23,7 @@ import (
 
 	"github.com/loemraw/shelloe/internal/securitykey"
 	"github.com/loemraw/shelloe/internal/securitykey/securitykeytest"
+	"github.com/loemraw/shelloe/internal/sshdtest"
 )
 
 const (
@@ -492,21 +490,17 @@ func TestOpenSSHAcceptsTheSignature(t *testing.T) {
 }
 
 func TestLoginWithOpenSSH(t *testing.T) {
-	sshd := os.Getenv("SHELLOE_SSHD")
-	if sshd == "" {
-		t.Skip("set SHELLOE_SSHD to an sshd that can run unprivileged to run this test")
-	}
 	osUser, err := user.Current()
 	if err != nil {
 		t.Fatal(err)
 	}
 	fake := newAuthenticator(t)
 	// authorized_keys holds the key as SSH Term writes it.
-	addr, hostKey := startSSHD(t, sshd, fake.AuthorizedKey(sshTermType, "web-shell"))
+	server := sshdtest.Start(t, fake.AuthorizedKey(sshTermType, "web-shell"))
 
 	t.Run("configured key", func(t *testing.T) {
 		signer := parseKey(t, fake.AuthorizedKey(sshTermType, "")).Signer(fake.Get)
-		output, err := runCommand(addr, osUser.Username, hostKey, signer, "echo hello")
+		output, err := runCommand(server.Addr, osUser.Username, server.HostKey, signer, "echo hello")
 		if err != nil {
 			t.Fatalf("logging in and running echo hello: %v", err)
 		}
@@ -518,7 +512,7 @@ func TestLoginWithOpenSSH(t *testing.T) {
 	t.Run("key not in authorized_keys", func(t *testing.T) {
 		stranger := newAuthenticator(t)
 		signer := parseKey(t, stranger.AuthorizedKey(canonicalType, "")).Signer(stranger.Get)
-		_, err := runCommand(addr, osUser.Username, hostKey, signer, "echo hello")
+		_, err := runCommand(server.Addr, osUser.Username, server.HostKey, signer, "echo hello")
 		if err == nil {
 			t.Fatal("sshd let in a key that isn't in authorized_keys")
 		}
@@ -526,101 +520,6 @@ func TestLoginWithOpenSSH(t *testing.T) {
 			t.Errorf("login error = %q, want sshd to refuse the key", err)
 		}
 	})
-}
-
-// startSSHD runs sshd on 127.0.0.1 with its own host key, letting in
-// authorizedKeys, and returns its address once it accepts connections.
-func startSSHD(t *testing.T, sshd string, authorizedKeys []byte) (addr string, hostKey ssh.PublicKey) {
-	t.Helper()
-	dir := t.TempDir()
-
-	hostPublicKey, hostPrivateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hostKey, err = ssh.NewPublicKey(hostPublicKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hostKeyPEM, err := ssh.MarshalPrivateKey(hostPrivateKey, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	hostKeyPath := filepath.Join(dir, "ssh_host_ed25519_key")
-	if err := os.WriteFile(hostKeyPath, pem.EncodeToMemory(hostKeyPEM), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	authorizedKeysPath := filepath.Join(dir, "authorized_keys")
-	if err := os.WriteFile(authorizedKeysPath, authorizedKeys, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	addr = freeAddress(t)
-	config := fmt.Sprintf(`ListenAddress %s
-HostKey %s
-AuthorizedKeysFile %s
-PidFile none
-StrictModes no
-LogLevel VERBOSE
-PasswordAuthentication no
-KbdInteractiveAuthentication no
-PubkeyAcceptedAlgorithms +webauthn-sk-ecdsa-sha2-nistp256@openssh.com
-PubkeyAuthOptions verify-required
-HostKeyAlgorithms ssh-ed25519
-`, addr, hostKeyPath, authorizedKeysPath)
-	configPath := filepath.Join(dir, "sshd_config")
-	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	var sshdLog bytes.Buffer
-	cmd := exec.Command(sshd, "-D", "-e", "-f", configPath)
-	cmd.Stdout = &sshdLog
-	cmd.Stderr = &sshdLog
-	// sshd's session processes hold its stderr; don't wait for them forever.
-	cmd.WaitDelay = 5 * time.Second
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("starting sshd: %v", err)
-	}
-	exited := make(chan struct{})
-	var waitErr error
-	go func() {
-		waitErr = cmd.Wait()
-		close(exited)
-	}()
-	t.Cleanup(func() {
-		cmd.Process.Kill()
-		<-exited
-		t.Logf("sshd log:\n%s", sshdLog.String())
-	})
-
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		conn, err := net.DialTimeout("tcp", addr, time.Second)
-		if err == nil {
-			conn.Close()
-			return addr, hostKey
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("sshd didn't accept connections on %s within 10 seconds: %v", addr, err)
-		}
-		select {
-		case <-exited:
-			t.Fatalf("sshd exited before accepting connections: %v", waitErr)
-		case <-time.After(50 * time.Millisecond):
-		}
-	}
-}
-
-// freeAddress returns a 127.0.0.1 address whose port nothing listens on.
-func freeAddress(t *testing.T) string {
-	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-	return listener.Addr().String()
 }
 
 // runCommand logs in to addr as username with signer and returns what command prints.
