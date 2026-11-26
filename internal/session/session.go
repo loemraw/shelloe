@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -20,6 +21,8 @@ type Config struct {
 	HostKey ssh.PublicKey // the only host key accepted
 	Key     *securitykey.Key
 	// Authenticator makes the security key's signatures, for the login and for the forwarded agent.
+	// If the session ends during a signature for the forwarded agent, that signature waits until
+	// Authenticator returns, so Authenticator should give up when the session ends.
 	Authenticator securitykey.Authenticator
 	// Command runs instead of the login shell when not empty.
 	Command    string
@@ -56,6 +59,8 @@ type Session struct {
 
 	done chan struct{}
 	err  error // session.Wait's result, set before done is closed
+
+	closeOnce sync.Once
 }
 
 // Start logs in over conn and starts the command, or the login shell, on a pty.
@@ -175,10 +180,13 @@ func (s *Session) Wait() error {
 	return s.err
 }
 
-// Close ends the session and the connection.
+// Close ends the session and the connection. It may be called more than once, and after the session has ended.
 func (s *Session) Close() error {
-	s.session.Close()
-	// Output nobody reads would otherwise keep the session from ending.
-	s.output.Close()
-	return s.client.Close()
+	s.closeOnce.Do(func() {
+		// The connection first: a Write stuck on a stalled connection holds the channel's lock until it closes.
+		s.client.Close()
+		// Output nobody reads would otherwise keep the session from ending.
+		s.output.Close()
+	})
+	return nil
 }
