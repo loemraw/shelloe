@@ -357,6 +357,7 @@ func TestSessionCloseEndsIt(t *testing.T) {
 	config := l.config
 	config.Command = "yes"
 	s := l.start(t, config)
+	readUntil(t, s, "y")
 
 	s.Close()
 	wait(t, s, 5*time.Second)

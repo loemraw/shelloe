@@ -155,6 +155,12 @@ func startSession(t *testing.T, server *testServer, command string) *Session {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Smaller than x/crypto's 2 MB channel window, so that a Write to a stalled
+	// server blocks in the connection, holding the channel's lock. Linux's
+	// default for loopback holds the whole window.
+	if err := conn.(*net.TCPConn).SetWriteBuffer(64 << 10); err != nil {
+		t.Fatal(err)
+	}
 	sshConn, channels, requests, err := ssh.NewClientConn(conn, "server", &ssh.ClientConfig{
 		User:            "someone",
 		Auth:            []ssh.AuthMethod{ssh.Password("password")},
