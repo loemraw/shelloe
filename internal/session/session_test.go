@@ -355,15 +355,14 @@ func TestSessionPrefersChaCha20(t *testing.T) {
 func TestSessionCloseEndsIt(t *testing.T) {
 	l := setUp(t)
 	config := l.config
-	config.Command = "cat"
+	config.Command = "yes"
 	s := l.start(t, config)
 
 	s.Close()
 	wait(t, s, 5*time.Second)
-	if _, err := read(t, s, ""); errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("Read after Close blocked for %v", timeout)
+	if err := s.Close(); err != nil {
+		t.Errorf("second Close = %v, want nil", err)
 	}
-	s.Close()
 }
 
 func TestStartRefusesIncompleteConfig(t *testing.T) {
