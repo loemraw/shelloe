@@ -272,15 +272,14 @@ func openPage(t *testing.T, key *securitykeytest.Authenticator, serverAddr strin
 		t.Fatal(err)
 	}
 	p.credentialID = randomBytes(t, 16)
-	_, err = chromedp.Call(ctx, webauthn.AddCredential, webauthn.AddCredentialParams{
+	_, err = chromedp.Call(ctx, addCredential, addCredentialParams{
 		AuthenticatorID: p.authenticator,
-		Credential: &webauthn.Credential{
+		Credential: credential{
 			CredentialID:         p.credentialID,
 			IsResidentCredential: true,
 			RpID:                 rpID,
 			PrivateKey:           privateKey,
 			UserHandle:           randomBytes(t, 16),
-			SignCount:            0,
 		},
 	})
 	if err != nil {
@@ -303,6 +302,26 @@ func openPage(t *testing.T, key *securitykeytest.Authenticator, serverAddr strin
 		t.Fatalf("opening %s: %v", origin, err)
 	}
 	return p
+}
+
+// addCredential is WebAuthn.addCredential, sending only the fields set
+// here. cdproto's Credential sends every field, and Chrome refuses some
+// unless the authenticator supports them, such as
+// generateCmtgKeyOnNextOperation.
+var addCredential = cdp.Command[addCredentialParams, cdp.Empty]{Method: webauthn.CommandAddCredential}
+
+type addCredentialParams struct {
+	AuthenticatorID webauthn.AuthenticatorID `json:"authenticatorId"`
+	Credential      credential               `json:"credential"`
+}
+
+type credential struct {
+	CredentialID         []byte `json:"credentialId"`
+	IsResidentCredential bool   `json:"isResidentCredential"`
+	RpID                 string `json:"rpId"`
+	PrivateKey           []byte `json:"privateKey"` // PKCS #8
+	UserHandle           []byte `json:"userHandle"`
+	SignCount            int    `json:"signCount"`
 }
 
 func randomBytes(t *testing.T, n int) []byte {
