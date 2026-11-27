@@ -20,17 +20,13 @@ import (
 	"github.com/coder/websocket"
 	"golang.org/x/crypto/ssh"
 
+	"github.com/loemraw/shelloe/internal/flowcontrol"
 	"github.com/loemraw/shelloe/internal/page"
 	"github.com/loemraw/shelloe/internal/securitykey"
 	"github.com/loemraw/shelloe/internal/session"
 )
 
-const (
-	dialTimeout = 15 * time.Second
-	chunkSize   = 32 << 10 // the most output passed to the terminal in one write
-	// writesInFlight is how many chunks the terminal may hold before it has processed them.
-	writesInFlight = 4
-)
+const dialTimeout = 15 * time.Second
 
 var uint8Array = js.Global().Get("Uint8Array")
 
@@ -51,7 +47,7 @@ func connect(_ js.Value, args []js.Value) any {
 		status:     options.Get("status"),
 		inputReady: make(chan struct{}, 1),
 		sizes:      make(chan size, 1),
-		slots:      make(chan struct{}, writesInFlight),
+		output:     flowcontrol.New(),
 	}
 	// The Funcs are never released: JS may call them after the session has
 	// ended, and a released Func must not be called.
@@ -78,8 +74,8 @@ type client struct {
 
 	sizes chan size // the latest size not yet sent to the server
 
-	slots chan struct{} // one for each chunk the terminal hasn't processed yet
-	done  js.Func       // the write callback's done, which frees a slot
+	output *flowcontrol.Output
+	done   js.Func // the write callback's done
 }
 
 type size struct{ cols, rows int }
@@ -190,28 +186,15 @@ func (c *client) end(message string) {
 
 // copyOutput passes the session's output to the page until it ends.
 func (c *client) copyOutput(s *session.Session) {
-	buffer := make([]byte, chunkSize)
-	for {
-		n, err := s.Read(buffer)
-		if n > 0 {
-			// Waiting for the terminal to process earlier chunks stops the reading
-			// when it falls behind, so the SSH window fills and the server stops sending.
-			c.slots <- struct{}{}
-			chunk := uint8Array.New(n)
-			js.CopyBytesToJS(chunk, buffer[:n])
-			c.write.Invoke(chunk, c.done)
-		}
-		if err != nil {
-			return
-		}
-	}
+	c.output.Copy(s, func(chunk []byte) {
+		array := uint8Array.New(len(chunk))
+		js.CopyBytesToJS(array, chunk)
+		c.write.Invoke(array, c.done)
+	})
 }
 
 func (c *client) writeDone(js.Value, []js.Value) any {
-	select {
-	case <-c.slots:
-	default:
-	}
+	c.output.Processed()
 	return nil
 }
 

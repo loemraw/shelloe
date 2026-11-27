@@ -73,7 +73,8 @@ async function load() {
     WebAssembly.instantiateStreaming(fetch("shelloe.wasm"), go.importObject),
     fetch("config.json").then((response) => response.json()),
   ]);
-  go.run(instance);
+  const stopped = () => show("The shelloe client stopped. Reload the page.");
+  go.run(instance).then(stopped, stopped);
   return config;
 }
 

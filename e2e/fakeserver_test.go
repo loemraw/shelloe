@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,16 +15,35 @@ import (
 	"golang.org/x/crypto/ssh/agent"
 )
 
-// fakeServer is an SSH server in the test process. It lets anyone in without
-// a signature and hands each session to the test once its shell or command
-// has started.
+// fakeServer is an SSH server in the test process. It hands each session to
+// the test once its shell or command has started.
 type fakeServer struct {
 	addr     string
 	hostKey  ssh.PublicKey
 	sessions chan *fakeSession
+	// keyQueries counts the key-asking server's checks of the client's key.
+	keyQueries atomic.Int32
+
+	mu    sync.Mutex
+	conns []net.Conn
 }
 
+// startFakeServer starts a fake server that lets anyone in without a signature.
 func startFakeServer(t *testing.T) *fakeServer {
+	t.Helper()
+	return startServer(t, false)
+}
+
+// startKeyAskingServer starts a fake server that asks for the key at login
+// and accepts any. x/crypto's client then sends a query, gets PK_OK and
+// signs, but x/crypto's server can't verify a webauthn signature, so every
+// login fails after the signature.
+func startKeyAskingServer(t *testing.T) *fakeServer {
+	t.Helper()
+	return startServer(t, true)
+}
+
+func startServer(t *testing.T, askForKey bool) *fakeServer {
 	t.Helper()
 	_, hostPrivateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -33,8 +53,6 @@ func startFakeServer(t *testing.T) *fakeServer {
 	if err != nil {
 		t.Fatal(err)
 	}
-	config := &ssh.ServerConfig{NoClientAuth: true}
-	config.AddHostKey(hostSigner)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -46,16 +64,37 @@ func startFakeServer(t *testing.T) *fakeServer {
 		hostKey:  hostSigner.PublicKey(),
 		sessions: make(chan *fakeSession, 8),
 	}
+	config := &ssh.ServerConfig{NoClientAuth: !askForKey}
+	if askForKey {
+		config.PublicKeyCallback = func(ssh.ConnMetadata, ssh.PublicKey) (*ssh.Permissions, error) {
+			server.keyQueries.Add(1)
+			return nil, nil
+		}
+	}
+	config.AddHostKey(hostSigner)
 	go func() {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
 				return
 			}
+			server.mu.Lock()
+			server.conns = append(server.conns, conn)
+			server.mu.Unlock()
 			go server.serve(conn, config)
 		}
 	}()
+	t.Cleanup(server.closeConnections)
 	return server
+}
+
+// closeConnections closes every connection the server has accepted, as a server that goes away would.
+func (server *fakeServer) closeConnections() {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	for _, conn := range server.conns {
+		conn.Close()
+	}
 }
 
 func (server *fakeServer) serve(conn net.Conn, config *ssh.ServerConfig) {
@@ -163,6 +202,17 @@ func (s *fakeSession) Write(p []byte) (int, error) { return s.channel.Write(p) }
 // Exit ends the session with status.
 func (s *fakeSession) Exit(status uint32) {
 	s.channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{status}))
+	s.channel.Close()
+}
+
+// ExitSignal ends the session as if the signal name, such as "TERM", had killed it.
+func (s *fakeSession) ExitSignal(name string) {
+	s.channel.SendRequest("exit-signal", false, ssh.Marshal(struct {
+		Signal     string
+		CoreDumped bool
+		Error      string
+		Language   string
+	}{Signal: name}))
 	s.channel.Close()
 }
 
