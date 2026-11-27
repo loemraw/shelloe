@@ -1,1 +1,4 @@
 .claude/
+web/shelloe.wasm
+web/wasm_exec.js
+web/vendor/
