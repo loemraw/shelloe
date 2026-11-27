@@ -7,6 +7,7 @@ require (
 	github.com/chromedp/chromedp v0.24.0
 	github.com/coder/websocket v1.8.15
 	golang.org/x/crypto v0.59.0
+	golang.org/x/image v0.48.0
 )
 
 require (

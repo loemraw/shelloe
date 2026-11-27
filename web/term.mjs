@@ -5,10 +5,12 @@ import { ClipboardAddon } from "./vendor/addon-clipboard.mjs";
 import { FitAddon } from "./vendor/addon-fit.mjs";
 import { UnicodeGraphemesAddon } from "./vendor/addon-unicode-graphemes.mjs";
 
-export function openTerminal(element) {
+const systemFonts = 'ui-monospace, Menlo, Consolas, "DejaVu Sans Mono", monospace';
+
+export function openTerminal(element, fontFamily) {
   const terminal = new Terminal({
     allowProposedApi: true,
-    fontFamily: 'ui-monospace, Menlo, Consolas, "DejaVu Sans Mono", monospace',
+    fontFamily: fontFamily === undefined ? systemFonts : `"${fontFamily}", ${systemFonts}`,
   });
   const fit = new FitAddon();
   terminal.loadAddon(fit);

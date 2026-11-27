@@ -1,4 +1,4 @@
-// Package page serves the web shell's page: the files of one directory, and the page's configuration as /config.json.
+// Package page serves the web shell's page: the files of one directory, the terminal's font, and the page's configuration as /config.json.
 package page
 
 import (
@@ -28,6 +28,7 @@ import (
 const contentSecurityPolicy = "default-src 'none'; " +
 	"script-src 'self' 'wasm-unsafe-eval'; " +
 	"style-src 'self' 'unsafe-inline'; " +
+	"font-src 'self'; " +
 	"connect-src 'self'; " +
 	"base-uri 'none'; " +
 	"form-action 'none'; " +
@@ -50,6 +51,42 @@ type Config struct {
 	Command string `json:"command,omitempty"` // the command to run instead of the login shell; "" runs the login shell
 }
 
+// Font is the terminal's typeface: a font file for each style.
+//
+// A zero Font leaves the terminal in the system's monospace font. Bold, Italic
+// and BoldItalic need Regular; the browser draws a style without a file from
+// Regular.
+type Font struct {
+	Regular, Bold, Italic, BoldItalic string // paths of font files; "" for none
+}
+
+type fontFormat struct {
+	contentType string
+	extension   string
+}
+
+// fontFormats are the font formats by the first 4 bytes of their files.
+var fontFormats = map[string]fontFormat{
+	"wOF2":             {"font/woff2", ".woff2"},
+	"wOFF":             {"font/woff", ".woff"},
+	"\x00\x01\x00\x00": {"font/ttf", ".ttf"},
+	"true":             {"font/ttf", ".ttf"},
+	"OTTO":             {"font/otf", ".otf"},
+}
+
+// fontFace is a style of the font, as config.json lists it.
+type fontFace struct {
+	URL    string `json:"url"`
+	Weight string `json:"weight"`
+	Style  string `json:"style"`
+}
+
+// servedConfig is what /config.json holds.
+type servedConfig struct {
+	Config
+	Font []fontFace `json:"font,omitempty"`
+}
+
 type file struct {
 	content     []byte
 	contentType string
@@ -58,12 +95,13 @@ type file struct {
 
 type handler struct {
 	files  map[string]file
+	fonts  map[string]file
 	config []byte
 }
 
-// Handler returns an http.Handler that serves the files under dir as they are
-// when it's called, and config as /config.json.
-func Handler(dir string, config Config) (http.Handler, error) {
+// Handler returns an http.Handler that serves the files under dir and font's
+// files as they are when it's called, and config as /config.json.
+func Handler(dir string, config Config, font Font) (http.Handler, error) {
 	if config.User == "" {
 		return nil, errors.New("page: the user is empty")
 	}
@@ -82,11 +120,54 @@ func Handler(dir string, config Config) (http.Handler, error) {
 		return nil, fmt.Errorf("page: %s has no index.html", dir)
 	}
 
-	encoded, err := json.Marshal(config)
+	fonts, faces, err := loadFont(font)
+	if err != nil {
+		return nil, err
+	}
+
+	encoded, err := json.Marshal(servedConfig{Config: config, Font: faces})
 	if err != nil {
 		return nil, fmt.Errorf("page: %w", err)
 	}
-	return &handler{files: files, config: encoded}, nil
+	return &handler{files: files, fonts: fonts, config: encoded}, nil
+}
+
+// loadFont reads font's files, and returns them by the name each is served
+// at, and the faces that config.json lists.
+func loadFont(font Font) (map[string]file, []fontFace, error) {
+	if font.Regular == "" && font != (Font{}) {
+		return nil, nil, errors.New("page: font: a bold or italic file without a regular one")
+	}
+	styles := []struct {
+		path          string
+		weight, style string
+	}{
+		{font.Regular, "normal", "normal"},
+		{font.Bold, "bold", "normal"},
+		{font.Italic, "normal", "italic"},
+		{font.BoldItalic, "bold", "italic"},
+	}
+	files := map[string]file{}
+	var faces []fontFace
+	for _, s := range styles {
+		if s.path == "" {
+			continue
+		}
+		content, err := os.ReadFile(s.path)
+		if err != nil {
+			return nil, nil, fmt.Errorf("page: font: %w", err)
+		}
+		format, ok := fontFormats[string(content[:min(4, len(content))])]
+		if !ok {
+			return nil, nil, fmt.Errorf("page: font: %s isn't a WOFF2, WOFF, TrueType or OpenType font", s.path)
+		}
+		sum := sha256.Sum256(content)
+		hash := hex.EncodeToString(sum[:])
+		name := "fonts/" + hash + format.extension
+		files[name] = file{content: content, contentType: format.contentType, etag: `"` + hash + `"`}
+		faces = append(faces, fontFace{URL: name, Weight: s.weight, Style: s.style})
+	}
+	return files, faces, nil
 }
 
 func loadFiles(dir string) (map[string]file, error) {
@@ -160,6 +241,13 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	name := strings.TrimPrefix(r.URL.Path, "/")
+	if f, ok := h.fonts[name]; ok {
+		header.Set("Content-Type", f.contentType)
+		header.Set("Cache-Control", "public, max-age=31536000, immutable")
+		header.Set("ETag", f.etag)
+		http.ServeContent(w, r, name, time.Time{}, bytes.NewReader(f.content))
+		return
+	}
 	if name == "" {
 		name = "index.html"
 	}
