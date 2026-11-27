@@ -65,6 +65,9 @@ func (a *Authenticator) AuthorizedKey(spelling string, comment string) []byte {
 	return []byte(line + "\n")
 }
 
+// PrivateKey returns the key, for tests that hand it to another authenticator, such as a browser's virtual one.
+func (a *Authenticator) PrivateKey() *ecdsa.PrivateKey { return a.privateKey }
+
 // Get signs challenge for rpID like navigator.credentials.get; use a.Get as a securitykey.Authenticator.
 func (a *Authenticator) Get(rpID string, challenge []byte) (*securitykey.Assertion, error) {
 	if rpID != a.rpID {
