@@ -22,6 +22,12 @@ jobs:
           sudo apt-get update && sudo apt-get install -y openssh-server openssh-client
           sudo mkdir -p /run/sshd
       - run: go vet ./...
+      - run: go vet ./cmd/shelloe-wasm/
+        env:
+          GOOS: js
+          GOARCH: wasm
+      - run: scripts/vendor-xterm.py
       - run: go test ./...
         env:
           SHELLOE_SSHD: /usr/sbin/sshd
+          SHELLOE_CHROME: /usr/bin/google-chrome
