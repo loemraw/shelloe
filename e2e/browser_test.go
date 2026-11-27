@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -27,6 +29,10 @@ import (
 	"github.com/chromedp/cdproto/webauthn"
 	"github.com/chromedp/chromedp"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/image/font/gofont/gomono"
+	"golang.org/x/image/font/gofont/gomonobold"
+	"golang.org/x/image/font/gofont/gomonobolditalic"
+	"golang.org/x/image/font/gofont/gomonoitalic"
 
 	"github.com/loemraw/shelloe/internal/flowcontrol"
 	"github.com/loemraw/shelloe/internal/page"
@@ -272,10 +278,13 @@ func openPage(t *testing.T, key *securitykeytest.Authenticator, serverAddr strin
 // pageOptions change what openPageWith serves and how it opens the page.
 // The zero value does what openPage does.
 type pageOptions struct {
-	dir        string // the directory to serve instead of the built page
-	noRelay    bool   // serve no /ws
-	untouched  bool   // the security key waits for a touch, until setPresence(true)
-	initScript string // runs in the page before its own scripts, after recordErrors
+	dir        string        // the directory to serve instead of the built page
+	noRelay    bool          // serve no /ws
+	untouched  bool          // the security key waits for a touch, until setPresence(true)
+	initScript string        // runs in the page before its own scripts, after recordErrors
+	font       page.Font     // the terminal's font
+	fontsHeld  chan struct{} // the font's files arrive only once this is closed, or the test has ended
+	heldFont   string        // with fontsHeld, the one font URL path to hold, like /fonts/<hex>.ttf; "" holds them all
 }
 
 func openPageWith(t *testing.T, key *securitykeytest.Authenticator, serverAddr string, hostKey ssh.PublicKey, options pageOptions) *testPage {
@@ -298,12 +307,24 @@ func openPageWith(t *testing.T, key *securitykeytest.Authenticator, serverAddr s
 		User:    osUser.Username,
 		Key:     string(key.AuthorizedKey(keyType, "")),
 		HostKey: string(ssh.MarshalAuthorizedKey(hostKey)),
-	})
+	}, options.font)
 	if err != nil {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/", pageHandler)
+	testEnded := make(chan struct{})
+	if options.fontsHeld != nil {
+		mux.Handle("/fonts/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if options.heldFont == "" || r.URL.Path == options.heldFont {
+				select {
+				case <-options.fontsHeld:
+				case <-testEnded:
+				}
+			}
+			pageHandler.ServeHTTP(w, r)
+		}))
+	}
 	if !options.noRelay {
 		relayHandler, err := relay.Handler(serverAddr, origin)
 		if err != nil {
@@ -314,6 +335,7 @@ func openPageWith(t *testing.T, key *securitykeytest.Authenticator, serverAddr s
 	server := &http.Server{Handler: mux}
 	go server.Serve(listener)
 	t.Cleanup(func() { server.Close() })
+	t.Cleanup(func() { close(testEnded) })
 
 	browserCtx, err := startBrowser()
 	if err != nil {
@@ -444,10 +466,10 @@ func (p *testPage) do(what string, actions ...chromedp.Action[chromedp.Void]) {
 	}
 }
 
-// screen returns the text on the terminal's screen.
+// screen returns the text on the terminal's screen, "" until the terminal has opened.
 func (p *testPage) screen() string {
 	p.t.Helper()
-	return evaluate[string](p, `document.querySelector(".xterm-rows").innerText`)
+	return evaluate[string](p, `document.querySelector(".xterm-rows")?.innerText ?? ""`)
 }
 
 // waitForScreen waits until the screen shows want, and returns the screen.
@@ -613,6 +635,37 @@ func (p *testPage) resizeViewport(width, height int) {
 func (p *testPage) domRows() int {
 	p.t.Helper()
 	return evaluate[int](p, `document.querySelectorAll(".xterm-rows > div").length`)
+}
+
+// terminalFont returns the font-family that the terminal's text is drawn in.
+func (p *testPage) terminalFont() string {
+	p.t.Helper()
+	return evaluate[string](p, `getComputedStyle(document.querySelector(".xterm-rows")).fontFamily`)
+}
+
+// writeFontFile writes a font file that holds content, and returns its path.
+func writeFontFile(t *testing.T, content []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "font")
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// openPageShowingAPrompt opens the page with options, its relay to a fake
+// server, and waits until the session has started and the screen shows the
+// server's prompt.
+func openPageShowingAPrompt(t *testing.T, options pageOptions) *testPage {
+	t.Helper()
+	key := newKey(t)
+	server := startFakeServer(t)
+	p := openPageWith(t, key, server.addr, server.hostKey, options)
+	if _, err := server.nextSession(t).Write([]byte("prompt$ ")); err != nil {
+		t.Fatal(err)
+	}
+	p.waitForScreen("prompt$")
+	return p
 }
 
 // otherHostKey returns a host key that no server has.
@@ -956,6 +1009,9 @@ func TestPageSaysWhenItCantLoadTheClient(t *testing.T) {
 	if button {
 		t.Error("the Reconnect button is shown, though reconnecting can't load the client")
 	}
+	if evaluate[bool](p, `document.querySelector(".xterm") !== null`) {
+		t.Error("the page opened a terminal, though the client didn't load")
+	}
 }
 
 func TestPageSaysWhenTheClientStops(t *testing.T) {
@@ -1068,5 +1124,160 @@ func TestPageWaitsForTheTerminalBeforeReadingMore(t *testing.T) {
 	p.waitForScreen("end-of-output")
 	if early := evaluate[int](p, `window.__earlyDone`); early != 0 {
 		t.Errorf("the terminal called done %d times before it had processed the chunk", early)
+	}
+}
+
+// recordFontLoading records when the client sets globalThis.shelloe, in
+// __clientAt, and when the terminal opens, in __terminalAt. __fontWarnings
+// holds what the page passes to console.warn, and __facesLoaded counts the
+// font faces that have loaded.
+const recordFontLoading = `
+(() => {
+  window.__fontWarnings = [];
+  window.__facesLoaded = 0;
+  let client;
+  Object.defineProperty(globalThis, "shelloe", {
+    configurable: true,
+    get: () => client,
+    set: (value) => {
+      if (window.__clientAt === undefined) {
+        window.__clientAt = performance.now();
+      }
+      client = value;
+    },
+  });
+  new MutationObserver((records, observer) => {
+    if (document.querySelector("#terminal .xterm") !== null) {
+      window.__terminalAt = performance.now();
+      observer.disconnect();
+    }
+  }).observe(document, {childList: true, subtree: true});
+  const consoleWarn = console.warn;
+  console.warn = (...args) => {
+    __fontWarnings.push(args.join(" "));
+    consoleWarn.apply(console, args);
+  };
+  const load = FontFace.prototype.load;
+  FontFace.prototype.load = function () {
+    const loading = load.call(this);
+    loading.then(() => __facesLoaded++, () => {});
+    return loading;
+  };
+})();
+`
+
+// hasFontFace reports whether the document has a face of the family shelloe.
+func (p *testPage) hasFontFace() bool {
+	p.t.Helper()
+	return evaluate[bool](p, `[...document.fonts].some((face) => face.family === "shelloe")`)
+}
+
+func TestPageDrawsTheTerminalInTheServedFont(t *testing.T) {
+	p := openPageShowingAPrompt(t, pageOptions{font: page.Font{Regular: writeFontFile(t, gomono.TTF)}})
+
+	if family := p.terminalFont(); !strings.HasPrefix(strings.TrimLeft(family, `"`), "shelloe") {
+		t.Errorf("the terminal's font-family is %s, want it to start with shelloe", family)
+	}
+	if !evaluate[bool](p, `[...document.fonts].some((face) => face.family === "shelloe" && face.status === "loaded")`) {
+		t.Error("the document has no loaded face of the family shelloe")
+	}
+}
+
+func TestPageLoadsEveryStyleOfTheFont(t *testing.T) {
+	p := openPageShowingAPrompt(t, pageOptions{font: page.Font{
+		Regular:    writeFontFile(t, gomono.TTF),
+		Bold:       writeFontFile(t, gomonobold.TTF),
+		Italic:     writeFontFile(t, gomonoitalic.TTF),
+		BoldItalic: writeFontFile(t, gomonobolditalic.TTF),
+	}})
+
+	faces := evaluate[[]string](p, `[...document.fonts]
+		.filter((face) => face.family === "shelloe" && face.status === "loaded")
+		.map((face) => face.weight + " " + face.style)`)
+	slices.Sort(faces)
+	if want := []string{"bold italic", "bold normal", "normal italic", "normal normal"}; !slices.Equal(faces, want) {
+		t.Errorf("the document's loaded faces of shelloe are %q (weight and style), want %q", faces, want)
+	}
+}
+
+func TestPageUsesTheSystemFontWhenTheFontIsSlow(t *testing.T) {
+	p := openPageShowingAPrompt(t, pageOptions{
+		font:       page.Font{Regular: writeFontFile(t, gomono.TTF)},
+		fontsHeld:  make(chan struct{}),
+		initScript: recordFontLoading,
+	})
+
+	if family := p.terminalFont(); strings.Contains(family, "shelloe") {
+		t.Errorf("the terminal's font-family is %s, want the system's monospace font", family)
+	}
+	clientAt := evaluate[float64](p, `window.__clientAt`)
+	terminalAt := evaluate[float64](p, `window.__terminalAt`)
+	if terminalAt < 1000 {
+		t.Errorf("the terminal opened %.0f ms after the page started loading, want 1000 ms or later", terminalAt)
+	}
+	if waited := terminalAt - max(clientAt, 1000); waited >= 500 {
+		t.Errorf("the terminal opened %.0f ms after the client had loaded (at %.0f ms) and 1000 ms had passed, want less than 500 ms", waited, clientAt)
+	}
+}
+
+func TestPageUsesTheSystemFontWhenOneStyleIsSlow(t *testing.T) {
+	bold := sha256.Sum256(gomonobold.TTF)
+	p := openPageShowingAPrompt(t, pageOptions{
+		font: page.Font{
+			Regular:    writeFontFile(t, gomono.TTF),
+			Bold:       writeFontFile(t, gomonobold.TTF),
+			Italic:     writeFontFile(t, gomonoitalic.TTF),
+			BoldItalic: writeFontFile(t, gomonobolditalic.TTF),
+		},
+		fontsHeld:  make(chan struct{}),
+		heldFont:   "/fonts/" + hex.EncodeToString(bold[:]) + ".ttf",
+		initScript: recordFontLoading,
+	})
+
+	if family := p.terminalFont(); strings.Contains(family, "shelloe") {
+		t.Errorf("the terminal's font-family is %s, want the system's monospace font", family)
+	}
+	if p.hasFontFace() {
+		t.Error("the document has a face of the family shelloe, though the bold face hasn't arrived")
+	}
+	if loaded := evaluate[int](p, `window.__facesLoaded`); loaded < 3 {
+		t.Errorf("%d faces loaded, want the 3 that weren't held", loaded)
+	}
+}
+
+func TestPageKeepsTheSystemFontWhenTheFontArrivesLate(t *testing.T) {
+	fontsHeld := make(chan struct{})
+	p := openPageShowingAPrompt(t, pageOptions{
+		font:       page.Font{Regular: writeFontFile(t, gomono.TTF)},
+		fontsHeld:  fontsHeld,
+		initScript: recordFontLoading,
+	})
+
+	close(fontsHeld)
+	if !poll(func() bool { return evaluate[int](p, `window.__facesLoaded`) == 1 }) {
+		t.Fatalf("the font didn't load within %v of arriving", timeout)
+	}
+	if family := p.terminalFont(); strings.Contains(family, "shelloe") {
+		t.Errorf("the terminal's font-family is %s, want the system's monospace font", family)
+	}
+	if p.hasFontFace() {
+		t.Error("the document has a face of the family shelloe, which arrived after the terminal opened")
+	}
+}
+
+func TestPageUsesTheSystemFontWhenTheFontIsBroken(t *testing.T) {
+	// The server takes it for TrueType, and the browser can't read it.
+	broken := append([]byte("\x00\x01\x00\x00"), bytes.Repeat([]byte("not a font "), 100)...)
+	p := openPageShowingAPrompt(t, pageOptions{
+		font:       page.Font{Regular: writeFontFile(t, broken)},
+		initScript: recordFontLoading,
+	})
+
+	if family := p.terminalFont(); strings.Contains(family, "shelloe") {
+		t.Errorf("the terminal's font-family is %s, want the system's monospace font", family)
+	}
+	warnings := evaluate[[]string](p, `window.__fontWarnings`)
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "Couldn't load the font") {
+		t.Errorf("the page warned %q, want one warning that it couldn't load the font", warnings)
 	}
 }

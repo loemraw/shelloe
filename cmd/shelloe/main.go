@@ -23,6 +23,10 @@ func main() {
 	keyFile := flag.String("key", "", "file holding the security key's public key, an authorized_keys line")
 	hostKeyFile := flag.String("host-key", "", "file holding the SSH server's public host key, like /etc/ssh/ssh_host_ed25519_key.pub")
 	command := flag.String("command", "", "command to run instead of the login shell")
+	fontFile := flag.String("font", "", "font file for the terminal's text: WOFF2, WOFF, TrueType or OpenType; the system's monospace font if unset")
+	boldFontFile := flag.String("font-bold", "", "font file for bold text; drawn from -font if unset")
+	italicFontFile := flag.String("font-italic", "", "font file for italic text; drawn from -font if unset")
+	boldItalicFontFile := flag.String("font-bold-italic", "", "font file for bold italic text; drawn from -font if unset")
 	flag.Parse()
 
 	if *target == "" || *origin == "" || *web == "" || *user == "" || *keyFile == "" || *hostKeyFile == "" {
@@ -53,6 +57,11 @@ func main() {
 		Key:     strings.TrimSpace(string(key)),
 		HostKey: strings.TrimSpace(string(hostKey)),
 		Command: *command,
+	}, page.Font{
+		Regular:    *fontFile,
+		Bold:       *boldFontFile,
+		Italic:     *italicFontFile,
+		BoldItalic: *boldItalicFontFile,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
