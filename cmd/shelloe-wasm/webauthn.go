@@ -20,6 +20,10 @@ func webAuthn(ctx context.Context) securitykey.Authenticator {
 		if ctx.Err() != nil {
 			return nil, errSessionEnded
 		}
+		credentials := js.Global().Get("navigator").Get("credentials")
+		if credentials.IsUndefined() {
+			return nil, errors.New("the browser offers no security key here: serve the page over HTTPS or from localhost")
+		}
 		challengeArray := uint8Array.New(len(challenge))
 		js.CopyBytesToJS(challengeArray, challenge)
 		controller := js.Global().Get("AbortController").New()
@@ -40,6 +44,10 @@ func webAuthn(ctx context.Context) securitykey.Authenticator {
 		}
 		settled := make(chan result, 1)
 		fulfilled := js.FuncOf(func(_ js.Value, args []js.Value) any {
+			if args[0].IsNull() {
+				settled <- result{err: errors.New("the browser returned no credential")}
+				return nil
+			}
 			response := args[0].Get("response")
 			settled <- result{assertion: &securitykey.Assertion{
 				AuthenticatorData: bytesOf(response.Get("authenticatorData")),
@@ -55,7 +63,7 @@ func webAuthn(ctx context.Context) securitykey.Authenticator {
 		// Unlike the session's Funcs, these can be released: the promise calls one of them, once, as it settles.
 		defer fulfilled.Release()
 		defer rejected.Release()
-		js.Global().Get("navigator").Get("credentials").Call("get", options).Call("then", fulfilled, rejected)
+		credentials.Call("get", options).Call("then", fulfilled, rejected)
 
 		select {
 		case r := <-settled:

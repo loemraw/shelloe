@@ -28,6 +28,7 @@ import (
 	"github.com/chromedp/chromedp"
 	"golang.org/x/crypto/ssh"
 
+	"github.com/loemraw/shelloe/internal/flowcontrol"
 	"github.com/loemraw/shelloe/internal/page"
 	"github.com/loemraw/shelloe/internal/relay"
 	"github.com/loemraw/shelloe/internal/securitykey/securitykeytest"
@@ -43,32 +44,53 @@ const (
 	tabTimeout = 2 * time.Minute
 )
 
-// builtPage is the directory TestMain builds the page in, unless buildError says why it couldn't.
-var (
-	builtPage  string
-	buildError error
-)
-
 func TestMain(m *testing.M) {
 	os.Exit(runTests(m))
 }
 
 func runTests(m *testing.M) int {
-	dir, err := os.MkdirTemp("", "shelloe-page-")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	defer os.RemoveAll(dir)
-	builtPage = dir
-	buildError = buildPage(dir)
 	defer stopBrowser()
+	defer removeBuiltPage()
 	return m.Run()
+}
+
+// thePage is the page with its client, built by the first test that needs it.
+// Not by TestMain: go test notes the files that a test reads, so as to rerun
+// it when one changes, only once m.Run has started.
+var thePage struct {
+	once sync.Once
+	dir  string
+	err  error
+}
+
+// builtPage returns the directory of the built page, building it the first
+// time. It fails the test if the page didn't build.
+func builtPage(t *testing.T) string {
+	t.Helper()
+	thePage.once.Do(func() {
+		thePage.dir, thePage.err = os.MkdirTemp("", "shelloe-page-")
+		if thePage.err == nil {
+			thePage.err = buildPage(thePage.dir)
+		}
+	})
+	if thePage.err != nil {
+		t.Fatal(thePage.err)
+	}
+	return thePage.dir
+}
+
+func removeBuiltPage() {
+	if thePage.dir != "" {
+		os.RemoveAll(thePage.dir)
+	}
 }
 
 // buildPage copies the page's files into dir and builds the client next to them.
 func buildPage(dir string) error {
 	if err := checkVendored(); err != nil {
+		return err
+	}
+	if err := statSources(); err != nil {
 		return err
 	}
 	web := filepath.Join("..", "web")
@@ -104,6 +126,26 @@ func buildPage(dir string) error {
 	}
 	wasmExec := filepath.Join(strings.TrimSpace(string(goroot)), "lib", "wasm", "wasm_exec.js")
 	return copyFile(wasmExec, filepath.Join(dir, "wasm_exec.js"))
+}
+
+// statSources stats the module's Go files, go.mod and go.sum. go test reruns
+// a cached test when a file the test looked at has changed, and it doesn't
+// see what the go build of the client reads.
+func statSources() error {
+	return filepath.WalkDir("..", func(p string, entry fs.DirEntry, err error) error {
+		switch {
+		case err != nil:
+			return err
+		case entry.IsDir() && p != ".." && strings.HasPrefix(entry.Name(), "."):
+			return filepath.SkipDir
+		case entry.IsDir():
+			return nil
+		case strings.HasSuffix(p, ".go") || p == filepath.Join("..", "go.mod") || p == filepath.Join("..", "go.sum"):
+			_, err := os.Stat(p)
+			return err
+		}
+		return nil
+	})
 }
 
 // checkVendored makes sure that web/vendor holds every file that
@@ -180,9 +222,7 @@ func newKey(t *testing.T) *securitykeytest.Authenticator {
 	if os.Getenv("SHELLOE_CHROME") == "" {
 		t.Skip("set SHELLOE_CHROME to a Chrome binary to run this test")
 	}
-	if buildError != nil {
-		t.Fatal(buildError)
-	}
+	builtPage(t)
 	key, err := securitykeytest.New(rpID, "http://localhost")
 	if err != nil {
 		t.Fatalf("securitykeytest.New: %v", err)
@@ -190,12 +230,27 @@ func newKey(t *testing.T) *securitykeytest.Authenticator {
 	return key
 }
 
-// recordErrors runs in the page before its own scripts.
+// recordErrors runs in the page before its own scripts. Go's wasm_exec.js
+// prints a panic with console.log, and syscall/js reports a call to a
+// released Func with console.error.
 const recordErrors = `
 window.__errors = [];
 addEventListener("error", (event) => __errors.push("error: " + event.message));
 addEventListener("unhandledrejection", (event) => __errors.push("unhandled rejection: " + event.reason));
 addEventListener("securitypolicyviolation", (event) => __errors.push("CSP: " + event.violatedDirective + " " + event.blockedURI));
+const consoleError = console.error;
+console.error = (...args) => {
+  __errors.push("console.error: " + args.join(" "));
+  consoleError.apply(console, args);
+};
+const consoleLog = console.log;
+console.log = (...args) => {
+  const first = String(args[0]);
+  if (first.startsWith("panic:") || first.startsWith("fatal error:")) {
+    __errors.push("console.log: " + args.join(" "));
+  }
+  consoleLog.apply(console, args);
+};
 `
 
 // testPage is the page, open in a tab of the browser.
@@ -211,6 +266,20 @@ type testPage struct {
 // fails if the page logs an error.
 func openPage(t *testing.T, key *securitykeytest.Authenticator, serverAddr string, hostKey ssh.PublicKey) *testPage {
 	t.Helper()
+	return openPageWith(t, key, serverAddr, hostKey, pageOptions{})
+}
+
+// pageOptions change what openPageWith serves and how it opens the page.
+// The zero value does what openPage does.
+type pageOptions struct {
+	dir        string // the directory to serve instead of the built page
+	noRelay    bool   // serve no /ws
+	untouched  bool   // the security key waits for a touch, until setPresence(true)
+	initScript string // runs in the page before its own scripts, after recordErrors
+}
+
+func openPageWith(t *testing.T, key *securitykeytest.Authenticator, serverAddr string, hostKey ssh.PublicKey, options pageOptions) *testPage {
+	t.Helper()
 	osUser, err := user.Current()
 	if err != nil {
 		t.Fatal(err)
@@ -221,11 +290,11 @@ func openPage(t *testing.T, key *securitykeytest.Authenticator, serverAddr strin
 	}
 	// The virtual credential is for the site localhost, and http://localhost is a secure context.
 	origin := fmt.Sprintf("http://localhost:%d", listener.Addr().(*net.TCPAddr).Port)
-	relayHandler, err := relay.Handler(serverAddr, origin)
-	if err != nil {
-		t.Fatal(err)
+	dir := options.dir
+	if dir == "" {
+		dir = builtPage(t)
 	}
-	pageHandler, err := page.Handler(builtPage, page.Config{
+	pageHandler, err := page.Handler(dir, page.Config{
 		User:    osUser.Username,
 		Key:     string(key.AuthorizedKey(keyType, "")),
 		HostKey: string(ssh.MarshalAuthorizedKey(hostKey)),
@@ -234,8 +303,14 @@ func openPage(t *testing.T, key *securitykeytest.Authenticator, serverAddr strin
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	mux.Handle("/ws", relayHandler)
 	mux.Handle("/", pageHandler)
+	if !options.noRelay {
+		relayHandler, err := relay.Handler(serverAddr, origin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mux.Handle("/ws", relayHandler)
+	}
 	server := &http.Server{Handler: mux}
 	go server.Serve(listener)
 	t.Cleanup(func() { server.Close() })
@@ -260,7 +335,7 @@ func openPage(t *testing.T, key *securitykeytest.Authenticator, serverAddr strin
 			HasResidentKey:              true,
 			HasUserVerification:         true,
 			IsUserVerified:              true,
-			AutomaticPresenceSimulation: true,
+			AutomaticPresenceSimulation: !options.untouched,
 		},
 	})
 	if err != nil {
@@ -286,8 +361,13 @@ func openPage(t *testing.T, key *securitykeytest.Authenticator, serverAddr strin
 		t.Fatalf("WebAuthn.addCredential: %v", err)
 	}
 
-	if _, err := chromedp.Call(ctx, cdppage.AddScriptToEvaluateOnNewDocument, cdppage.AddScriptToEvaluateOnNewDocumentParams{Source: recordErrors}); err != nil {
-		t.Fatalf("Page.addScriptToEvaluateOnNewDocument: %v", err)
+	for _, script := range []string{recordErrors, options.initScript} {
+		if script == "" {
+			continue
+		}
+		if _, err := chromedp.Call(ctx, cdppage.AddScriptToEvaluateOnNewDocument, cdppage.AddScriptToEvaluateOnNewDocumentParams{Source: script}); err != nil {
+			t.Fatalf("Page.addScriptToEvaluateOnNewDocument: %v", err)
+		}
 	}
 	// Registered after the tab's cleanups, so it runs before the tab closes.
 	t.Cleanup(func() {
@@ -482,6 +562,13 @@ func (p *testPage) recordOverlay() {
 func (p *testPage) overlays() []string {
 	p.t.Helper()
 	return evaluate[[]string](p, `window.__overlays`)
+}
+
+// takeErrors returns the errors the page has logged so far and forgets them,
+// for a test that expects some.
+func (p *testPage) takeErrors() []string {
+	p.t.Helper()
+	return evaluate[[]string](p, `window.__errors.splice(0)`)
 }
 
 // signatures returns how many signatures the virtual authenticator has made.
@@ -703,7 +790,7 @@ func TestPageOffersToReconnectWhenTheSessionEnds(t *testing.T) {
 
 func TestPageShowsWhyItCouldntLogIn(t *testing.T) {
 	key := newKey(t)
-	server := startFakeServer(t)
+	server := startKeyAskingServer(t)
 	p := openPage(t, key, server.addr, otherHostKey(t))
 
 	message, button := p.waitForOverlay("Couldn't log in:")
@@ -754,5 +841,232 @@ func TestPageCancelsTheSecurityKeysRequestWhenTheSessionEnds(t *testing.T) {
 		}
 	case <-time.After(timeout):
 		t.Fatalf("the agent didn't sign in the new session within %v", timeout)
+	}
+}
+
+func TestPageGivesUpTheLoginWhenTheRelayHangsUp(t *testing.T) {
+	key := newKey(t)
+	server := startKeyAskingServer(t)
+	p := openPageWith(t, key, server.addr, server.hostKey, pageOptions{untouched: true})
+
+	// The server checks the key when the client offers it, before the
+	// signature. Half a second after the check, the client has the server's
+	// PK_OK and waits for the security key, which nobody touches.
+	if !poll(func() bool { return server.keyQueries.Load() > 0 }) {
+		t.Fatalf("the client didn't offer its key within %v", timeout)
+	}
+	time.Sleep(500 * time.Millisecond)
+	server.closeConnections()
+	if _, button := p.waitForOverlay("Couldn't log in:"); !button {
+		t.Error("the Reconnect button is hidden after the login failed")
+	}
+
+	p.setPresence(true)
+	p.clickReconnect()
+	if !poll(func() bool { return p.signatures() == 1 }) {
+		t.Fatalf("the security key didn't sign the next login within %v; the abandoned request may still be pending", timeout)
+	}
+	p.waitForOverlay("Couldn't log in:")
+}
+
+func TestPageSaysWhenTheBrowserCantUseASecurityKey(t *testing.T) {
+	key := newKey(t)
+	server := startKeyAskingServer(t)
+	p := openPageWith(t, key, server.addr, server.hostKey, pageOptions{
+		// As on a page served over plain HTTP from another host than localhost.
+		initScript: `Object.defineProperty(Navigator.prototype, "credentials", {get: () => undefined});`,
+	})
+
+	message, button := p.waitForOverlay("Couldn't log in:")
+	if !strings.Contains(message, "HTTPS or from localhost") {
+		t.Errorf("the overlay says %q, want it to say to serve the page over HTTPS or from localhost", message)
+	}
+	if !button {
+		t.Error("the Reconnect button is hidden after the login failed")
+	}
+}
+
+func TestPageSaysWhenTheBrowserReturnsNoCredential(t *testing.T) {
+	key := newKey(t)
+	server := startKeyAskingServer(t)
+	p := openPageWith(t, key, server.addr, server.hostKey, pageOptions{
+		initScript: `CredentialsContainer.prototype.get = () => Promise.resolve(null);`,
+	})
+
+	message, button := p.waitForOverlay("Couldn't log in:")
+	if !strings.Contains(message, "the browser returned no credential") {
+		t.Errorf("the overlay says %q, want it to say that the browser returned no credential", message)
+	}
+	if !button {
+		t.Error("the Reconnect button is hidden after the login failed")
+	}
+}
+
+func TestPageSaysWhenTheConnectionIsLost(t *testing.T) {
+	key := newKey(t)
+	server := startFakeServer(t)
+	p := openPage(t, key, server.addr, server.hostKey)
+	server.nextSession(t)
+
+	server.closeConnections()
+	if _, button := p.waitForOverlay("The connection to the server was lost."); !button {
+		t.Error("the Reconnect button is hidden after the connection was lost")
+	}
+}
+
+func TestPageSaysWhichSignalEndedTheSession(t *testing.T) {
+	key := newKey(t)
+	server := startFakeServer(t)
+	p := openPage(t, key, server.addr, server.hostKey)
+
+	server.nextSession(t).ExitSignal("TERM")
+	if _, button := p.waitForOverlay("The session ended: signal TERM."); !button {
+		t.Error("the Reconnect button is hidden after the session ended")
+	}
+}
+
+func TestPageSaysWhenItCantReachTheServer(t *testing.T) {
+	key := newKey(t)
+	server := startFakeServer(t)
+	p := openPageWith(t, key, server.addr, server.hostKey, pageOptions{noRelay: true})
+
+	message, button := p.waitForOverlay("Couldn't reach the server:")
+	t.Logf("the overlay says %q", message)
+	if !button {
+		t.Error("the Reconnect button is hidden though the server couldn't be reached")
+	}
+}
+
+func TestPageSaysWhenItCantLoadTheClient(t *testing.T) {
+	key := newKey(t)
+	server := startFakeServer(t)
+	dir := t.TempDir()
+	if err := os.CopyFS(dir, os.DirFS(builtPage(t))); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "shelloe.wasm")); err != nil {
+		t.Fatal(err)
+	}
+	// The browser logs the failed request itself, but not with console.error,
+	// so the test's check for errors doesn't see it.
+	p := openPageWith(t, key, server.addr, server.hostKey, pageOptions{dir: dir})
+
+	message, button := p.waitForOverlay("Couldn't load shelloe:")
+	t.Logf("the overlay says %q", message)
+	if button {
+		t.Error("the Reconnect button is shown, though reconnecting can't load the client")
+	}
+}
+
+func TestPageSaysWhenTheClientStops(t *testing.T) {
+	key := newKey(t)
+	server := startFakeServer(t)
+	p := openPage(t, key, server.addr, server.hostKey)
+	server.nextSession(t)
+
+	// connect without its options panics, which ends the client.
+	p.do("stopping the client", chromedp.Evaluate[chromedp.Void](`setTimeout(() => shelloe.connect())`))
+	if _, button := p.waitForOverlay("The shelloe client stopped. Reload the page."); button {
+		t.Error("the Reconnect button is shown, though the client has stopped")
+	}
+	logged := p.takeErrors()
+	if !slices.ContainsFunc(logged, func(e string) bool { return strings.HasPrefix(e, "console.log: panic:") }) {
+		t.Errorf("the page logged %q, want the client's panic among them", logged)
+	}
+}
+
+// holdWrites stands in for a terminal that hasn't processed anything yet: the
+// client's writes wait in __held, their done uncalled, until __release passes
+// them on to the page's terminal. __earlyDone counts the dones called before
+// the write that was handed them returned.
+const holdWrites = `
+(() => {
+  window.__holding = true;
+  window.__held = [];
+  window.__earlyDone = 0;
+  let pageWrite;
+  const passOn = (bytes, done) => {
+    let returned = false;
+    pageWrite(bytes, () => {
+      if (!returned) {
+        __earlyDone++;
+      }
+      done();
+    });
+    returned = true;
+  };
+  window.__release = () => {
+    __holding = false;
+    for (const [bytes, done] of __held) {
+      passOn(bytes, done);
+    }
+  };
+  let client;
+  Object.defineProperty(globalThis, "shelloe", {
+    configurable: true,
+    get: () => client,
+    set: (real) => {
+      client = {
+        connect: (options) => {
+          pageWrite = options.write;
+          const write = (bytes, done) => {
+            if (__holding) {
+              __held.push([bytes, done]);
+            } else {
+              passOn(bytes, done);
+            }
+          };
+          return real.connect({...options, write});
+        },
+      };
+    },
+  });
+})();
+`
+
+func TestPageWaitsForTheTerminalBeforeReadingMore(t *testing.T) {
+	key := newKey(t)
+	server := startFakeServer(t)
+	p := openPageWith(t, key, server.addr, server.hostKey, pageOptions{initScript: holdWrites})
+	s := server.nextSession(t)
+
+	var output bytes.Buffer
+	for i := 0; output.Len() < 8<<20; i++ {
+		fmt.Fprintf(&output, "line %d\r\n", i)
+	}
+	output.WriteString("end-of-output\r\n")
+	written := make(chan error, 1)
+	go func() {
+		_, err := s.Write(output.Bytes())
+		written <- err
+	}()
+
+	held := func() int { return evaluate[int](p, `window.__held.length`) }
+	if !poll(func() bool { return held() >= flowcontrol.ChunksInFlight }) {
+		t.Fatalf("the client passed %d chunks to the terminal within %v, want %d", held(), timeout, flowcontrol.ChunksInFlight)
+	}
+	// The SSH window, 2 MB, and the chunks in the terminal hold far less than the output.
+	time.Sleep(500 * time.Millisecond)
+	if n := held(); n != flowcontrol.ChunksInFlight {
+		t.Fatalf("the client passed %d chunks to a terminal that had processed none, want %d", n, flowcontrol.ChunksInFlight)
+	}
+	select {
+	case err := <-written:
+		t.Fatalf("the server wrote all its output (error: %v) while the terminal had processed none of it", err)
+	default:
+	}
+
+	p.do("releasing the terminal", chromedp.Evaluate[chromedp.Void](`__release()`))
+	select {
+	case err := <-written:
+		if err != nil {
+			t.Fatalf("writing the output: %v", err)
+		}
+	case <-time.After(timeout):
+		t.Fatalf("the server's write didn't return within %v of the terminal processing its chunks", timeout)
+	}
+	p.waitForScreen("end-of-output")
+	if early := evaluate[int](p, `window.__earlyDone`); early != 0 {
+		t.Errorf("the terminal called done %d times before it had processed the chunk", early)
 	}
 }

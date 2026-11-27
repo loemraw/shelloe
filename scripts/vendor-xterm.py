@@ -5,8 +5,8 @@ The pins are in vendor-xterm.json, next to this script: each npm package's
 version, its tarball's sha512 integrity, and the files to take from it.
 
 Downloads the pinned npm tarballs, checks each against its pinned integrity,
-and writes the listed files unmodified into web/vendor/. Any other file
-directly in web/vendor/ is deleted. Nothing is written if a download fails
+and writes the listed files unmodified into web/vendor/. Anything else in
+web/vendor/ is deleted. Nothing is written if a download fails
 verification or a listed file is missing from its tarball.
 
 To move to a new version, change the version and the integrity in the pins.
@@ -22,6 +22,7 @@ import base64
 import hashlib
 import io
 import json
+import shutil
 import sys
 import tarfile
 import urllib.request
@@ -70,9 +71,13 @@ def main():
         (VENDOR_DIR / out_name).write_bytes(content)
         print(f"wrote web/vendor/{out_name}")
     for path in VENDOR_DIR.iterdir():
-        if path.is_file() and path.name not in outputs:
+        if path.name in outputs:
+            continue
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
             path.unlink()
-            print(f"removed web/vendor/{path.name}")
+        print(f"removed web/vendor/{path.name}")
 
 
 main()

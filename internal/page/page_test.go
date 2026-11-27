@@ -249,6 +249,7 @@ func TestOtherMethodsAreRefused(t *testing.T) {
 
 func TestHeadGetsHeadersWithoutABody(t *testing.T) {
 	server, _ := startPage(t)
+	getResponse, _ := get(t, server, "GET", "/main.mjs", nil)
 	response, body := get(t, server, "HEAD", "/main.mjs", nil)
 	if response.StatusCode != http.StatusOK {
 		t.Errorf("status = %d, want 200", response.StatusCode)
@@ -256,6 +257,26 @@ func TestHeadGetsHeadersWithoutABody(t *testing.T) {
 	if len(body) != 0 {
 		t.Errorf("body = %q, want none", body)
 	}
+	if got, want := response.Header.Get("Content-Type"), "text/javascript; charset=utf-8"; got != want {
+		t.Errorf("Content-Type = %q, want %q", got, want)
+	}
+	if got, want := response.Header.Get("ETag"), getResponse.Header.Get("ETag"); got == "" || got != want {
+		t.Errorf("ETag = %q, want GET's %q", got, want)
+	}
+	if got := response.Header.Get("Cache-Control"); got != "no-cache" {
+		t.Errorf("Cache-Control = %q, want no-cache", got)
+	}
+	checkSecurityHeaders(t, response)
+
+	t.Run("missing file", func(t *testing.T) {
+		response, body := get(t, server, "HEAD", "/missing", nil)
+		if response.StatusCode != http.StatusNotFound {
+			t.Errorf("status = %d, want 404", response.StatusCode)
+		}
+		if len(body) != 0 {
+			t.Errorf("body = %q, want none", body)
+		}
+	})
 }
 
 func TestHandlerRefusesBadArguments(t *testing.T) {
