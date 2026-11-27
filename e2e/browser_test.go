@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -771,6 +772,50 @@ func TestPagePassesBytesThroughUnchanged(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.waitForScreen("€")
+}
+
+// recordCopies records the text the page writes to the clipboard in __copied.
+const recordCopies = `
+window.__copied = [];
+Clipboard.prototype.writeText = function (text) {
+  window.__copied.push(text);
+  return Promise.resolve();
+};
+`
+
+func TestPageCopiesToTheClipboardForTheDefaultSelectionAndAnyNamingIt(t *testing.T) {
+	key := newKey(t)
+	server := startFakeServer(t)
+	p := openPageWith(t, key, server.addr, server.hostKey, pageOptions{initScript: recordCopies})
+	s := server.nextSession(t)
+	if _, err := s.Write([]byte("prompt$ ")); err != nil {
+		t.Fatal(err)
+	}
+	p.waitForScreen("prompt$")
+
+	var osc52 strings.Builder
+	for _, c := range []struct{ selection, text string }{
+		{"c", "for c"},
+		{"", "for the default"},
+		{"pc", "for a list naming c"},
+		{"p", "for p only"},
+		{"s", "for s only"},
+		{"0", "for cut buffer 0"},
+		{"c", "last"},
+	} {
+		osc52.WriteString("\x1b]52;" + c.selection + ";" + base64.StdEncoding.EncodeToString([]byte(c.text)) + "\x07")
+	}
+	if _, err := s.Write([]byte(osc52.String())); err != nil {
+		t.Fatal(err)
+	}
+
+	copied := func() []string { return evaluate[[]string](p, `window.__copied`) }
+	if !poll(func() bool { c := copied(); return len(c) > 0 && c[len(c)-1] == "last" }) {
+		t.Fatalf("the page copied %q within %v, want it to end with %q", copied(), timeout, "last")
+	}
+	if got, want := copied(), []string{"for c", "for the default", "for a list naming c", "last"}; !slices.Equal(got, want) {
+		t.Errorf("the page copied %q, want %q", got, want)
+	}
 }
 
 func TestPageShowsEverythingAFloodOfOutputSends(t *testing.T) {
