@@ -21,6 +21,8 @@ go run ./cmd/shelloe -web web -target server:22 -origin https://shell.example.co
 
 To draw the terminal in your own typeface, add `-font` with its font file, and `-font-bold`, `-font-italic` and `-font-bold-italic` for those styles if you have them. WOFF2 files are the smallest. If the font hasn't arrived by the time the client has loaded, and at least a second has passed, that visit uses the system's monospace font; the browser keeps the font for the next visit.
 
+Shift-, Option- or Cmd-click a link (Ctrl-click off macOS) to open it in a new tab: web addresses in the output, http and https. A plain click goes to the program, as in tmux with `mouse on`. A link to the server's localhost (`localhost`, `127.0.0.1`, `[::1]`, `0.0.0.0`) means nothing to the browser. With `-localhost-url https://dev-{port}.example.com`, such links open at that URL with their port in place of `{port}`, and their path, query and fragment kept. Serving those names, by something that reaches the server's localhost, is up to the deployment.
+
 The page must be served from the security key's site (its rpID), over HTTPS or on localhost.
 
 Run the tests with `go test ./...`. Tests that need sshd or Chrome skip unless `SHELLOE_SSHD` (an sshd binary) and `SHELLOE_CHROME` (a Chrome binary) are set. The browser tests need xterm.js fetched first.

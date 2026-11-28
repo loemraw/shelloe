@@ -12,12 +12,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"math"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -279,13 +281,14 @@ func openPage(t *testing.T, key *securitykeytest.Authenticator, serverAddr strin
 // pageOptions change what openPageWith serves and how it opens the page.
 // The zero value does what openPage does.
 type pageOptions struct {
-	dir        string        // the directory to serve instead of the built page
-	noRelay    bool          // serve no /ws
-	untouched  bool          // the security key waits for a touch, until setPresence(true)
-	initScript string        // runs in the page before its own scripts, after recordErrors
-	font       page.Font     // the terminal's font
-	fontsHeld  chan struct{} // the font's files arrive only once this is closed, or the test has ended
-	heldFont   string        // with fontsHeld, the one font URL path to hold, like /fonts/<hex>.ttf; "" holds them all
+	dir          string        // the directory to serve instead of the built page
+	noRelay      bool          // serve no /ws
+	untouched    bool          // the security key waits for a touch, until setPresence(true)
+	initScript   string        // runs in the page before its own scripts, after recordErrors
+	font         page.Font     // the terminal's font
+	fontsHeld    chan struct{} // the font's files arrive only once this is closed, or the test has ended
+	heldFont     string        // with fontsHeld, the one font URL path to hold, like /fonts/<hex>.ttf; "" holds them all
+	localhostURL string        // where links to the SSH server's localhost open, with {port} for the port
 }
 
 func openPageWith(t *testing.T, key *securitykeytest.Authenticator, serverAddr string, hostKey ssh.PublicKey, options pageOptions) *testPage {
@@ -305,9 +308,10 @@ func openPageWith(t *testing.T, key *securitykeytest.Authenticator, serverAddr s
 		dir = builtPage(t)
 	}
 	pageHandler, err := page.Handler(dir, page.Config{
-		User:    osUser.Username,
-		Key:     string(key.AuthorizedKey(keyType, "")),
-		HostKey: string(ssh.MarshalAuthorizedKey(hostKey)),
+		User:         osUser.Username,
+		Key:          string(key.AuthorizedKey(keyType, "")),
+		HostKey:      string(ssh.MarshalAuthorizedKey(hostKey)),
+		LocalhostURL: options.localhostURL,
 	}, options.font)
 	if err != nil {
 		t.Fatal(err)
@@ -815,6 +819,624 @@ func TestPageCopiesToTheClipboardForTheDefaultSelectionAndAnyNamingIt(t *testing
 	}
 	if got, want := copied(), []string{"for c", "for the default", "for a list naming c", "last"}; !slices.Equal(got, want) {
 		t.Errorf("the page copied %q, want %q", got, want)
+	}
+}
+
+// recordOpens records the arguments of each call of window.open in __opened.
+const recordOpens = `
+window.__opened = [];
+window.open = (...args) => {
+  window.__opened.push(args);
+  return null;
+};
+`
+
+// recordConfirms records the message of each call of confirm in
+// __confirmed, and answers no.
+const recordConfirms = `
+window.__confirmed = [];
+window.confirm = (message) => {
+  window.__confirmed.push(String(message));
+  return false;
+};
+`
+
+const (
+	// trackMouse has the terminal report presses and releases of the mouse's
+	// buttons to the program, in SGR's encoding, as tmux with mouse on does.
+	trackMouse = "\x1b[?1000h\x1b[?1006h"
+	// clearScreen clears the screen and moves the cursor to its top-left.
+	clearScreen = "\x1b[H\x1b[2J"
+	// mouseReport starts every report of the mouse in SGR's encoding.
+	mouseReport = "\x1b[<"
+)
+
+// openPageWithOutput opens the page with options and its relay to a fake
+// server, has the server write output, and waits until the screen shows shown.
+func openPageWithOutput(t *testing.T, options pageOptions, output, shown string) (*testPage, *fakeSession) {
+	t.Helper()
+	key := newKey(t)
+	server := startFakeServer(t)
+	p := openPageWith(t, key, server.addr, server.hostKey, options)
+	s := server.nextSession(t)
+	if _, err := s.Write([]byte(output)); err != nil {
+		t.Fatal(err)
+	}
+	p.waitForScreen(shown)
+	return p, s
+}
+
+// writeAndWait has the server write output in the session s, and waits until
+// the screen shows shown.
+func (p *testPage) writeAndWait(s *fakeSession, output, shown string) {
+	p.t.Helper()
+	if _, err := s.Write([]byte(output)); err != nil {
+		p.t.Fatal(err)
+	}
+	p.waitForScreen(shown)
+}
+
+// opened returns the arguments of each call of window.open that recordOpens
+// recorded, once the timers already set have run: the page opens a link from a timer.
+func (p *testPage) opened() [][]string {
+	p.t.Helper()
+	opened, err := chromedp.Run(p.ctx, chromedp.Evaluate[[][]string](
+		`new Promise((resolve) => setTimeout(() => resolve(window.__opened)))`, chromedp.EvalAwaitPromise))
+	if err != nil {
+		p.t.Fatalf("reading the calls of window.open: %v", err)
+	}
+	return opened
+}
+
+// waitForOpened waits until the page has called window.open n times, and
+// returns the arguments of each call.
+func (p *testPage) waitForOpened(n int) [][]string {
+	p.t.Helper()
+	var opened [][]string
+	if !poll(func() bool {
+		opened = p.opened()
+		return len(opened) >= n
+	}) {
+		p.t.Fatalf("the page called window.open %d times within %v, want %d; it opened %q", len(opened), timeout, n, opened)
+	}
+	return opened
+}
+
+// charCenter returns where in the viewport the middle of the character at
+// col on the screen's row is, both counted from 0.
+func (p *testPage) charCenter(row, col int) (x, y float64) {
+	p.t.Helper()
+	center := evaluate[[]float64](p, fmt.Sprintf(`(() => {
+		const row = document.querySelectorAll(".xterm-rows > div")[%d];
+		const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+		let offset = %d;
+		for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
+			if (offset < node.length) {
+				const range = document.createRange();
+				range.setStart(node, offset);
+				range.setEnd(node, offset + 1);
+				const rect = range.getBoundingClientRect();
+				return [rect.left + rect.width / 2, rect.top + rect.height / 2];
+			}
+			offset -= node.length;
+		}
+		return null;
+	})()`, row, col))
+	if center == nil {
+		p.t.Fatalf("row %d of the screen has no character at column %d", row, col)
+	}
+	return center[0], center[1]
+}
+
+// linkHovered reports whether xterm.js shows that a link is under the pointer.
+func (p *testPage) linkHovered() bool {
+	p.t.Helper()
+	return evaluate[bool](p, `document.querySelector(".xterm-screen").classList.contains("xterm-cursor-pointer")`)
+}
+
+// dispatchMouse dispatches the mouse event that params describe.
+func (p *testPage) dispatchMouse(params input.DispatchMouseEventParams) {
+	p.t.Helper()
+	if _, err := chromedp.Call(p.ctx, input.DispatchMouseEvent, params); err != nil {
+		p.t.Fatalf("dispatching %s at (%.0f, %.0f): %v", params.Type, params.X, params.Y, err)
+	}
+}
+
+// moveMouse moves the pointer to x, y in the viewport, with no button or key held.
+func (p *testPage) moveMouse(x, y float64) {
+	p.t.Helper()
+	p.dispatchMouse(input.DispatchMouseEventParams{Type: input.DispatchMouseEventTypeMouseMoved, X: x, Y: y})
+}
+
+// buttonBits are the mouse's buttons, as bits of DispatchMouseEventParams.Buttons.
+var buttonBits = map[input.MouseButton]int64{input.MouseButtonLeft: 1, input.MouseButtonMiddle: 4}
+
+// pressMouse presses button at x, y in the viewport, with modifiers held.
+func (p *testPage) pressMouse(x, y float64, button input.MouseButton, modifiers chromedp.Modifier) {
+	p.t.Helper()
+	p.dispatchMouse(input.DispatchMouseEventParams{
+		Type:       input.DispatchMouseEventTypeMousePressed,
+		X:          x,
+		Y:          y,
+		Modifiers:  int64(modifiers),
+		Button:     button,
+		Buttons:    buttonBits[button],
+		ClickCount: 1,
+	})
+}
+
+// dragMouse moves the pointer to x, y in the viewport, with the primary
+// button and modifiers held.
+func (p *testPage) dragMouse(x, y float64, modifiers chromedp.Modifier) {
+	p.t.Helper()
+	p.dispatchMouse(input.DispatchMouseEventParams{
+		Type:      input.DispatchMouseEventTypeMouseMoved,
+		X:         x,
+		Y:         y,
+		Modifiers: int64(modifiers),
+		Buttons:   buttonBits[input.MouseButtonLeft],
+	})
+}
+
+// releaseMouse lets button go at x, y in the viewport, with modifiers held.
+func (p *testPage) releaseMouse(x, y float64, button input.MouseButton, modifiers chromedp.Modifier) {
+	p.t.Helper()
+	p.dispatchMouse(input.DispatchMouseEventParams{
+		Type:       input.DispatchMouseEventTypeMouseReleased,
+		X:          x,
+		Y:          y,
+		Modifiers:  int64(modifiers),
+		Button:     button,
+		ClickCount: 1,
+	})
+}
+
+// click presses the primary button at x, y in the viewport and lets it go,
+// with modifiers held.
+func (p *testPage) click(x, y float64, modifiers chromedp.Modifier) {
+	p.t.Helper()
+	p.pressMouse(x, y, input.MouseButtonLeft, modifiers)
+	p.releaseMouse(x, y, input.MouseButtonLeft, modifiers)
+}
+
+// hoverLink moves the pointer onto the character at col on the screen's row,
+// waits until xterm.js shows a link under it, and returns where it is.
+func (p *testPage) hoverLink(row, col int) (x, y float64) {
+	p.t.Helper()
+	x, y = p.charCenter(row, col)
+	p.moveMouse(x, y)
+	if !poll(p.linkHovered) {
+		p.t.Fatalf("xterm.js showed no link under the pointer at row %d, column %d within %v", row, col, timeout)
+	}
+	return x, y
+}
+
+// clickCell moves the pointer onto the character at col on the screen's row,
+// and clicks there with modifiers held.
+func (p *testPage) clickCell(row, col int, modifiers chromedp.Modifier) {
+	p.t.Helper()
+	x, y := p.charCenter(row, col)
+	p.moveMouse(x, y)
+	p.click(x, y, modifiers)
+}
+
+// pointAt moves the pointer onto the character at col on the screen's row,
+// and returns where it is.
+func (p *testPage) pointAt(row, col int) (x, y float64) {
+	p.t.Helper()
+	x, y = p.charCenter(row, col)
+	p.moveMouse(x, y)
+	return x, y
+}
+
+// typeMarker types marker, and returns what the server received before it.
+func (p *testPage) typeMarker(s *fakeSession, marker string) []byte {
+	p.t.Helper()
+	p.typeText(marker)
+	input := s.waitForInput(p.t, []byte(marker))
+	return input[:bytes.Index(input, []byte(marker))]
+}
+
+func TestPageOpensALinkClickedWithShiftAltOrMetaWithoutTellingTheProgram(t *testing.T) {
+	link := "https://example.com/a?b#c"
+	p, s := openPageWithOutput(t, pageOptions{initScript: recordOpens}, trackMouse+clearScreen+link, link)
+
+	modifiers := []chromedp.Modifier{chromedp.ModifierShift, chromedp.ModifierAlt, chromedp.ModifierMeta}
+	for _, modifier := range modifiers {
+		p.clickCell(0, 5, modifier)
+	}
+
+	if before := p.typeMarker(s, "after-the-clicks"); bytes.Contains(before, []byte(mouseReport)) {
+		t.Errorf("the server received %q for the clicks, want no report of the mouse", before)
+	}
+	var want [][]string
+	for range modifiers {
+		want = append(want, []string{link, "_blank", "noopener,noreferrer"})
+	}
+	if got := p.waitForOpened(len(want)); !slices.EqualFunc(got, want, slices.Equal) {
+		t.Errorf("the page opened %q, want %q", got, want)
+	}
+}
+
+func TestPageLeavesAPlainClickOnALinkToTheProgram(t *testing.T) {
+	link := "https://example.com/a?b#c"
+	p, s := openPageWithOutput(t, pageOptions{initScript: recordOpens}, trackMouse+clearScreen+link, link)
+
+	p.clickCell(0, 5, chromedp.ModifierNone)
+	// The press and the release of the primary button on column 6 of row 1.
+	s.waitForInput(t, []byte(mouseReport+"0;6;1M"))
+	s.waitForInput(t, []byte(mouseReport+"0;6;1m"))
+	if opened := p.opened(); len(opened) != 0 {
+		t.Errorf("the page opened %q for a plain click, want nothing", opened)
+	}
+}
+
+func TestPageOpensALinkCtrlClickedUnlessThePlatformIsApples(t *testing.T) {
+	link := "https://example.com/a?b#c"
+	p, s := openPageWithOutput(t, pageOptions{initScript: recordOpens}, trackMouse+clearScreen+link, link)
+	platform := evaluate[string](p, `navigator.platform`)
+	apple := regexp.MustCompile(`Mac|iPhone|iPad`).MatchString(platform)
+
+	p.clickCell(0, 5, chromedp.ModifierCtrl)
+
+	// On Apple's systems, Ctrl-click is the context menu's click, which may reach the program.
+	before := p.typeMarker(s, "after-the-click")
+	var opened [][]string
+	if apple {
+		opened = p.opened()
+	} else {
+		opened = p.waitForOpened(1)
+	}
+	switch {
+	case apple && len(opened) != 0:
+		t.Errorf("on %s, the page opened %q for a Ctrl-click, want nothing", platform, opened)
+	case !apple && !slices.EqualFunc(opened, [][]string{{link, "_blank", "noopener,noreferrer"}}, slices.Equal):
+		t.Errorf("on %s, the page opened %q for a Ctrl-click, want %s once", platform, opened, link)
+	case !apple && bytes.Contains(before, []byte(mouseReport)):
+		t.Errorf("on %s, the server received %q for the Ctrl-click, want no report of the mouse", platform, before)
+	}
+}
+
+func TestPageOpensNoOSC8LinkAndNeverAsks(t *testing.T) {
+	output := clearScreen +
+		"\x1b]8;;https://example.com/osc\x1b\\label\x1b]8;;\x1b\\\r\n" +
+		"\x1b]8;;https://example.com/behind\x1b\\https://example.com/shown\x1b]8;;\x1b\\"
+	p, _ := openPageWithOutput(t, pageOptions{initScript: recordOpens + recordConfirms}, output, "shown")
+
+	p.clickCell(0, 2, chromedp.ModifierShift)
+	// xterm.js activates the link itself on a plain click; its own handler would ask with confirm.
+	p.clickCell(0, 2, chromedp.ModifierNone)
+	// A label that is a web address opens as one.
+	p.clickCell(1, 5, chromedp.ModifierShift)
+
+	want := [][]string{{"https://example.com/shown", "_blank", "noopener,noreferrer"}}
+	if got := p.waitForOpened(len(want)); !slices.EqualFunc(got, want, slices.Equal) {
+		t.Errorf("the page opened %q, want %q", got, want)
+	}
+	if confirmed := evaluate[[]string](p, `window.__confirmed`); len(confirmed) != 0 {
+		t.Errorf("the page asked %q, want no question", confirmed)
+	}
+}
+
+func TestPageOpensTheLinkTheScreenShowsUnderThePointer(t *testing.T) {
+	// The pointer rests on row 0 off any link, so xterm.js keeps row 0's links
+	// while the program redraws it.
+	redrawn := func(t *testing.T, before, after, shown string) *testPage {
+		t.Helper()
+		p, s := openPageWithOutput(t, pageOptions{initScript: recordOpens}, clearScreen+before, before)
+		p.pointAt(0, 1)
+		p.writeAndWait(s, after, shown)
+		return p
+	}
+
+	t.Run("a row redrawn under a pointer resting off its link", func(t *testing.T) {
+		p := redrawn(t, "xxxx https://example.com/old-one", clearScreen+"yyyy https://example.com/new-one", "new-one")
+		p.clickCell(0, 10, chromedp.ModifierShift)
+		want := [][]string{{"https://example.com/new-one", "_blank", "noopener,noreferrer"}}
+		if got := p.waitForOpened(1); !slices.EqualFunc(got, want, slices.Equal) {
+			t.Errorf("the page opened %q, want %q", got, want)
+		}
+	})
+
+	t.Run("a longer URL now shown where a shorter one was", func(t *testing.T) {
+		p := redrawn(t, "xxxx http://localhost:5173/", clearScreen+"yyyy http://localhost:5173/settings", "settings")
+		p.clickCell(0, 10, chromedp.ModifierShift)
+		want := [][]string{{"http://localhost:5173/settings", "_blank", "noopener,noreferrer"}}
+		if got := p.waitForOpened(1); !slices.EqualFunc(got, want, slices.Equal) {
+			t.Errorf("the page opened %q, want %q", got, want)
+		}
+	})
+
+	t.Run("a wrapped link partly redrawn", func(t *testing.T) {
+		key := newKey(t)
+		server := startFakeServer(t)
+		p := openPageWith(t, key, server.addr, server.hostKey, pageOptions{initScript: recordOpens})
+		s := server.nextSession(t)
+		cols, _ := s.size()
+		// It fills row 2 and goes on into row 3.
+		link := "https://example.com/" + strings.Repeat("a", cols-len("https://example.com/")) + "tail123456"
+		p.writeAndWait(s, clearScreen+"row zero\r\nrow one\r\n"+link, "tail123456")
+		// xterm.js holds the link as the one under the pointer while row 3 is redrawn.
+		x, y := p.hoverLink(3, 2)
+		p.writeAndWait(s, "\x1b[4;1H\x1b[2Kplain text here", "plain text here")
+
+		p.click(x, y, chromedp.ModifierShift)
+		p.typeMarker(s, "after-the-click")
+		if opened := p.opened(); len(opened) != 0 {
+			t.Errorf("the page opened %q, want nothing", opened)
+		}
+	})
+
+	t.Run("a full scrollback", func(t *testing.T) {
+		key := newKey(t)
+		server := startFakeServer(t)
+		p := openPageWith(t, key, server.addr, server.hostKey, pageOptions{initScript: recordOpens})
+		s := server.nextSession(t)
+		_, rows := s.size()
+		// More lines than the screen and xterm.js's scrollback of 1000 hold, so
+		// new output moves every line's text up a row without moving the line.
+		var output strings.Builder
+		lines := 1000 + rows + 50
+		for i := range lines {
+			fmt.Fprintf(&output, "\r\nGET https://example.com/r%05d", i)
+		}
+		p.writeAndWait(s, output.String(), fmt.Sprintf("r%05d", lines-1))
+		p.pointAt(3, 1)
+		output.Reset()
+		for i := range 5 {
+			fmt.Fprintf(&output, "\r\nGET https://example.com/s%05d", i)
+		}
+		p.writeAndWait(s, output.String(), "s00004")
+
+		row := strings.Fields(strings.Split(p.screen(), "\n")[3])
+		if len(row) != 2 {
+			t.Fatalf("row 3 shows %q, want GET and a URL", row)
+		}
+		p.clickCell(3, 12, chromedp.ModifierShift)
+		want := [][]string{{row[1], "_blank", "noopener,noreferrer"}}
+		if got := p.waitForOpened(1); !slices.EqualFunc(got, want, slices.Equal) {
+			t.Errorf("the page opened %q, want %q, which row 3 shows", got, want)
+		}
+	})
+}
+
+func TestPageOpensAWrappedLinkWhoseWideCharacterWrappedEarly(t *testing.T) {
+	key := newKey(t)
+	server := startFakeServer(t)
+	p := openPageWith(t, key, server.addr, server.hostKey, pageOptions{initScript: recordOpens})
+	s := server.nextSession(t)
+	cols, _ := s.size()
+	prefix := "https://example.com/wiki/"
+	// The first row has room for all but its last column, and 日 takes two.
+	middle := strings.Repeat("a", cols-1-len(prefix))
+	p.writeAndWait(s, clearScreen+prefix+middle+"日本語\r\nend", "end")
+
+	p.clickCell(0, 5, chromedp.ModifierShift)
+	// 日本語, as the URL's href writes it.
+	want := [][]string{{prefix + middle + "%E6%97%A5%E6%9C%AC%E8%AA%9E", "_blank", "noopener,noreferrer"}}
+	if got := p.waitForOpened(1); !slices.EqualFunc(got, want, slices.Equal) {
+		t.Errorf("the page opened %q, want %q", got, want)
+	}
+}
+
+func TestPageOpensAWrappedLinkPressedOnOneRowAndReleasedOnTheNext(t *testing.T) {
+	key := newKey(t)
+	server := startFakeServer(t)
+	p := openPageWith(t, key, server.addr, server.hostKey, pageOptions{initScript: recordOpens})
+	s := server.nextSession(t)
+	cols, _ := s.size()
+	// It fills row 0 and goes on into row 1.
+	link := "https://example.com/" + strings.Repeat("c", cols-len("https://example.com/")) + "rest12345"
+	p.writeAndWait(s, clearScreen+link+"\r\nend", "end")
+
+	x, y := p.pointAt(0, 5)
+	p.pressMouse(x, y, input.MouseButtonLeft, chromedp.ModifierShift)
+	x, y = p.charCenter(1, 3)
+	p.dragMouse(x, y, chromedp.ModifierShift)
+	p.releaseMouse(x, y, input.MouseButtonLeft, chromedp.ModifierShift)
+
+	want := [][]string{{link, "_blank", "noopener,noreferrer"}}
+	if got := p.waitForOpened(1); !slices.EqualFunc(got, want, slices.Equal) {
+		t.Errorf("the page opened %q, want %q", got, want)
+	}
+}
+
+func TestPageOpensALinkThatEndsInTheBottomRightCorner(t *testing.T) {
+	key := newKey(t)
+	server := startFakeServer(t)
+	p := openPageWith(t, key, server.addr, server.hostKey, pageOptions{initScript: recordOpens})
+	s := server.nextSession(t)
+	cols, rows := s.size()
+	link := "https://example.com/" + strings.Repeat("b", cols-len("https://example.com/"))
+	if _, err := s.Write([]byte(fmt.Sprintf("%s\x1b[%d;1H%s", clearScreen, rows, link))); err != nil {
+		t.Fatal(err)
+	}
+	p.waitForScreen(link)
+
+	p.clickCell(rows-1, 5, chromedp.ModifierShift)
+	want := [][]string{{link, "_blank", "noopener,noreferrer"}}
+	if got := p.waitForOpened(1); !slices.EqualFunc(got, want, slices.Equal) {
+		t.Errorf("the page opened %q, want %q", got, want)
+	}
+}
+
+func TestPageTreatsTheSameURLOnAnotherRowAsAnotherLink(t *testing.T) {
+	link := "https://example.com/same"
+	p, s := openPageWithOutput(t, pageOptions{initScript: recordOpens}, clearScreen+link+"\r\n\r\n"+link, link)
+
+	x, y := p.pointAt(0, 5)
+	p.pressMouse(x, y, input.MouseButtonLeft, chromedp.ModifierShift)
+	x, y = p.charCenter(2, 5)
+	p.dragMouse(x, y, chromedp.ModifierShift)
+	p.releaseMouse(x, y, input.MouseButtonLeft, chromedp.ModifierShift)
+
+	p.typeMarker(s, "after-the-click")
+	if opened := p.opened(); len(opened) != 0 {
+		t.Errorf("the page opened %q for a press on one link and a release on another, want nothing", opened)
+	}
+}
+
+func TestPageOpensALinkWhereverXtermJSUnderlinesIt(t *testing.T) {
+	link := "https://example.com/abc"
+	p, s := openPageWithOutput(t, pageOptions{initScript: recordOpens}, clearScreen+link+" tail\r\nplain", "plain")
+	cols, rows := s.size()
+	screen := evaluate[[]float64](p, `(() => {
+		const rect = document.querySelector(".xterm-screen").getBoundingClientRect();
+		return [rect.left, rect.top, rect.width, rect.height];
+	})()`)
+	left, top := screen[0], screen[1]
+	cellWidth, cellHeight := screen[2]/float64(cols), screen[3]/float64(rows)
+
+	// Whole pixels on each side of the link's right end and of its row's
+	// bottom border, where the cell under the pointer is a matter of rounding.
+	var points [][2]float64
+	linkEnd, rowEnd := left+float64(len(link))*cellWidth, top+cellHeight
+	for d := -1.0; d <= 1; d++ {
+		points = append(points, [2]float64{math.Floor(linkEnd) + d, top + cellHeight/2})
+		points = append(points, [2]float64{left + 5*cellWidth, math.Floor(rowEnd) + d})
+	}
+	for _, point := range points {
+		x, y := point[0], point[1]
+		p.moveMouse(x, y)
+		// xterm.js looks the pointer's link up in a task of its own.
+		if _, err := chromedp.Run(p.ctx, chromedp.Evaluate[bool](
+			`new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))`,
+			chromedp.EvalAwaitPromise)); err != nil {
+			t.Fatalf("waiting for two frames: %v", err)
+		}
+		hovered := p.linkHovered()
+		before := len(p.opened())
+		p.click(x, y, chromedp.ModifierShift)
+		p.typeMarker(s, fmt.Sprintf("after-%v-%v", x, y))
+		if opened := len(p.opened()) > before; opened != hovered {
+			t.Errorf("at (%v, %v) xterm.js underlined a link: %v; a Shift-click opened one: %v", x, y, hovered, opened)
+		}
+	}
+}
+
+func TestPageOpensNothingWhenALinkClickIsReleasedOffTheLink(t *testing.T) {
+	link := "https://example.com/a"
+	p, s := openPageWithOutput(t, pageOptions{initScript: recordOpens}, trackMouse+clearScreen+link+"\r\n\r\nplain", "plain")
+
+	x, y := p.pointAt(0, 5)
+	p.pressMouse(x, y, input.MouseButtonLeft, chromedp.ModifierShift)
+	x, y = p.charCenter(2, 2)
+	p.dragMouse(x, y, chromedp.ModifierShift)
+	p.releaseMouse(x, y, input.MouseButtonLeft, chromedp.ModifierShift)
+
+	if before := p.typeMarker(s, "after-the-click"); bytes.Contains(before, []byte(mouseReport)) {
+		t.Errorf("the server received %q for the click, want no report of the mouse", before)
+	}
+	if opened := p.opened(); len(opened) != 0 {
+		t.Errorf("the page opened %q for a click released off the link, want nothing", opened)
+	}
+}
+
+func TestPageLetsTheProgramHaveClicksThatArentLinkClicks(t *testing.T) {
+	link := "https://example.com/a"
+	p, s := openPageWithOutput(t, pageOptions{initScript: recordOpens}, trackMouse+clearScreen+link+"\r\n\r\nplain", "plain")
+
+	// Alt, as off Apple's systems xterm.js never reports a Shift-click.
+	x, y := p.pointAt(2, 2)
+	p.click(x, y, chromedp.ModifierAlt)
+	// The press and the release of the primary button with Alt, on column 3 of row 3.
+	s.waitForInput(t, []byte(mouseReport+"8;3;3M"))
+	s.waitForInput(t, []byte(mouseReport+"8;3;3m"))
+
+	x, y = p.pointAt(0, 5)
+	p.pressMouse(x, y, input.MouseButtonMiddle, chromedp.ModifierAlt)
+	p.releaseMouse(x, y, input.MouseButtonMiddle, chromedp.ModifierAlt)
+	// The middle button with Alt, on column 6 of row 1.
+	s.waitForInput(t, []byte(mouseReport+"9;6;1M"))
+	s.waitForInput(t, []byte(mouseReport+"9;6;1m"))
+
+	if opened := p.opened(); len(opened) != 0 {
+		t.Errorf("the page opened %q, want nothing", opened)
+	}
+}
+
+func TestPageOpensLinksToLocalhostAtTheLocalhostURL(t *testing.T) {
+	link := "http://localhost:5173/a?b#c"
+	tests := []struct {
+		name         string
+		localhostURL string
+		want         string
+	}{
+		{"with a localhost URL", "https://dev-{port}.example.com", "https://dev-5173.example.com/a?b#c"},
+		{"without one", "", link},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			p, _ := openPageWithOutput(t, pageOptions{initScript: recordOpens, localhostURL: test.localhostURL}, clearScreen+link, link)
+
+			p.clickCell(0, 5, chromedp.ModifierShift)
+			want := [][]string{{test.want, "_blank", "noopener,noreferrer"}}
+			if got := p.waitForOpened(1); !slices.EqualFunc(got, want, slices.Equal) {
+				t.Errorf("the page opened %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestPageResolvesWhereEachLinkOpens(t *testing.T) {
+	key := newKey(t)
+	server := startFakeServer(t)
+	p := openPage(t, key, server.addr, server.hostKey)
+
+	const template = "https://dev-{port}.example.com"
+	tests := []struct {
+		uri, localhostURL string
+		want              string // "" for null, nothing to open
+	}{
+		{"http://localhost:5173/", template, "https://dev-5173.example.com/"},
+		{"http://localhost:5173", template, "https://dev-5173.example.com/"},
+		{"http://127.0.0.1:8000/x?y=1#z", template, "https://dev-8000.example.com/x?y=1#z"},
+		{"http://127.1.2.3:9/", template, "https://dev-9.example.com/"},
+		{"http://[::1]:3000/", template, "https://dev-3000.example.com/"},
+		{"http://0.0.0.0:8000/", template, "https://dev-8000.example.com/"},
+		{"http://[::]:8000/", template, "https://dev-8000.example.com/"},
+		{"http://app.localhost:3000/", template, "https://dev-3000.example.com/"},
+		{"http://localhost/", template, "https://dev-80.example.com/"},
+		{"https://localhost/", template, "https://dev-443.example.com/"},
+		{"http://user:pw@localhost:3000/p", template, "https://dev-3000.example.com/p"},
+		{"http://localhostx:1/", template, "http://localhostx:1/"},
+		{"http://192.168.1.5:5173/", template, "http://192.168.1.5:5173/"},
+		{"https://example.com/a", template, "https://example.com/a"},
+		{"http://localhost:5173/", "", "http://localhost:5173/"},
+		{"http://localhost:5173/", "http://example.com:{port}", "http://example.com:5173/"},
+		{"ftp://localhost/", template, ""},
+		{"javascript:alert(1)", template, ""},
+		{"not a url", template, ""},
+	}
+	var calls [][2]string
+	for _, test := range tests {
+		calls = append(calls, [2]string{test.uri, test.localhostURL})
+	}
+	encoded, err := json.Marshal(calls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expression := fmt.Sprintf(`import("./links.mjs").then(({ resolveLink }) =>
+		%s.map(([uri, localhostURL]) => resolveLink(uri, localhostURL)))`, encoded)
+	resolved, err := chromedp.Run(p.ctx, chromedp.Evaluate[[]*string](expression, chromedp.EvalAwaitPromise))
+	if err != nil {
+		t.Fatalf("calling resolveLink: %v", err)
+	}
+	if len(resolved) != len(tests) {
+		t.Fatalf("resolveLink returned %d results, want %d", len(resolved), len(tests))
+	}
+	for i, test := range tests {
+		t.Run(fmt.Sprintf("%s with %q", test.uri, test.localhostURL), func(t *testing.T) {
+			got := resolved[i]
+			switch {
+			case test.want == "" && got != nil:
+				t.Errorf("resolveLink returned %q, want null", *got)
+			case test.want != "" && got == nil:
+				t.Errorf("resolveLink returned null, want %q", test.want)
+			case test.want != "" && *got != test.want:
+				t.Errorf("resolveLink returned %q, want %q", *got, test.want)
+			}
+		})
 	}
 }
 
