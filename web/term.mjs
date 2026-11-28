@@ -18,13 +18,6 @@ class BrowserClipboard extends BrowserClipboardProvider {
   }
 }
 
-const isApple = /Mac|iPhone|iPad/.test(navigator.platform);
-
-function opensLink(event) {
-  // Ctrl-click on Apple's systems is the context menu's click.
-  return event.shiftKey || event.altKey || event.metaKey || (event.ctrlKey && !isApple);
-}
-
 function sameLink(a, b) {
   return (
     a.text === b.text &&
@@ -36,8 +29,8 @@ function sameLink(a, b) {
 }
 
 // listenForLinkClicks calls onLink with the URI of the web link under the
-// pointer when the primary button clicks it with a key that opens links.
-// webLinks is the web-links add-on's link provider.
+// pointer when the primary button clicks it with Shift held. webLinks is the
+// web-links add-on's link provider.
 function listenForLinkClicks(element, terminal, webLinks, onLink) {
   let pressed = null;
 
@@ -80,7 +73,7 @@ function listenForLinkClicks(element, terminal, webLinks, onLink) {
 
   function press(event) {
     pressed = null;
-    if (event.button !== 0 || !opensLink(event)) {
+    if (event.button !== 0 || !event.shiftKey) {
       return;
     }
     const link = linkAt(cellAt(event));

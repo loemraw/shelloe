@@ -1037,22 +1037,16 @@ func (p *testPage) typeMarker(s *fakeSession, marker string) []byte {
 	return input[:bytes.Index(input, []byte(marker))]
 }
 
-func TestPageOpensALinkClickedWithShiftAltOrMetaWithoutTellingTheProgram(t *testing.T) {
+func TestPageOpensALinkShiftClickedWithoutTellingTheProgram(t *testing.T) {
 	link := "https://example.com/a?b#c"
 	p, s := openPageWithOutput(t, pageOptions{initScript: recordOpens}, trackMouse+clearScreen+link, link)
 
-	modifiers := []chromedp.Modifier{chromedp.ModifierShift, chromedp.ModifierAlt, chromedp.ModifierMeta}
-	for _, modifier := range modifiers {
-		p.clickCell(0, 5, modifier)
-	}
+	p.clickCell(0, 5, chromedp.ModifierShift)
 
-	if before := p.typeMarker(s, "after-the-clicks"); bytes.Contains(before, []byte(mouseReport)) {
-		t.Errorf("the server received %q for the clicks, want no report of the mouse", before)
+	if before := p.typeMarker(s, "after-the-click"); bytes.Contains(before, []byte(mouseReport)) {
+		t.Errorf("the server received %q for the click, want no report of the mouse", before)
 	}
-	var want [][]string
-	for range modifiers {
-		want = append(want, []string{link, "_blank", "noopener,noreferrer"})
-	}
+	want := [][]string{{link, "_blank", "noopener,noreferrer"}}
 	if got := p.waitForOpened(len(want)); !slices.EqualFunc(got, want, slices.Equal) {
 		t.Errorf("the page opened %q, want %q", got, want)
 	}
@@ -1068,32 +1062,6 @@ func TestPageLeavesAPlainClickOnALinkToTheProgram(t *testing.T) {
 	s.waitForInput(t, []byte(mouseReport+"0;6;1m"))
 	if opened := p.opened(); len(opened) != 0 {
 		t.Errorf("the page opened %q for a plain click, want nothing", opened)
-	}
-}
-
-func TestPageOpensALinkCtrlClickedUnlessThePlatformIsApples(t *testing.T) {
-	link := "https://example.com/a?b#c"
-	p, s := openPageWithOutput(t, pageOptions{initScript: recordOpens}, trackMouse+clearScreen+link, link)
-	platform := evaluate[string](p, `navigator.platform`)
-	apple := regexp.MustCompile(`Mac|iPhone|iPad`).MatchString(platform)
-
-	p.clickCell(0, 5, chromedp.ModifierCtrl)
-
-	// On Apple's systems, Ctrl-click is the context menu's click, which may reach the program.
-	before := p.typeMarker(s, "after-the-click")
-	var opened [][]string
-	if apple {
-		opened = p.opened()
-	} else {
-		opened = p.waitForOpened(1)
-	}
-	switch {
-	case apple && len(opened) != 0:
-		t.Errorf("on %s, the page opened %q for a Ctrl-click, want nothing", platform, opened)
-	case !apple && !slices.EqualFunc(opened, [][]string{{link, "_blank", "noopener,noreferrer"}}, slices.Equal):
-		t.Errorf("on %s, the page opened %q for a Ctrl-click, want %s once", platform, opened, link)
-	case !apple && bytes.Contains(before, []byte(mouseReport)):
-		t.Errorf("on %s, the server received %q for the Ctrl-click, want no report of the mouse", platform, before)
 	}
 }
 
@@ -1335,21 +1303,35 @@ func TestPageOpensNothingWhenALinkClickIsReleasedOffTheLink(t *testing.T) {
 func TestPageLetsTheProgramHaveClicksThatArentLinkClicks(t *testing.T) {
 	link := "https://example.com/a"
 	p, s := openPageWithOutput(t, pageOptions{initScript: recordOpens}, trackMouse+clearScreen+link+"\r\n\r\nplain", "plain")
+	apple := regexp.MustCompile(`Mac|iPhone|iPad`).MatchString(evaluate[string](p, `navigator.platform`))
 
-	// Alt, as off Apple's systems xterm.js never reports a Shift-click.
-	x, y := p.pointAt(2, 2)
-	p.click(x, y, chromedp.ModifierAlt)
-	// The press and the release of the primary button with Alt, on column 3 of row 3.
-	s.waitForInput(t, []byte(mouseReport+"8;3;3M"))
-	s.waitForInput(t, []byte(mouseReport+"8;3;3m"))
+	// The press and the release of the primary button with Alt, on column 6 of row 1.
+	p.clickCell(0, 5, chromedp.ModifierAlt)
+	s.waitForInput(t, []byte(mouseReport+"8;6;1M"))
+	s.waitForInput(t, []byte(mouseReport+"8;6;1m"))
 
-	x, y = p.pointAt(0, 5)
-	p.pressMouse(x, y, input.MouseButtonMiddle, chromedp.ModifierAlt)
-	p.releaseMouse(x, y, input.MouseButtonMiddle, chromedp.ModifierAlt)
-	// The middle button with Alt, on column 6 of row 1.
-	s.waitForInput(t, []byte(mouseReport+"9;6;1M"))
-	s.waitForInput(t, []byte(mouseReport+"9;6;1m"))
+	// Meta has no bit in the report, so it's the primary button's alone.
+	p.clickCell(0, 5, chromedp.ModifierMeta)
+	s.waitForInput(t, []byte(mouseReport+"0;6;1M"))
+	s.waitForInput(t, []byte(mouseReport+"0;6;1m"))
 
+	// Off Apple's systems, xterm.js keeps every Shift-click for its selection and reports none.
+	p.clickCell(2, 2, chromedp.ModifierShift)
+	x, y := p.pointAt(0, 5)
+	p.pressMouse(x, y, input.MouseButtonMiddle, chromedp.ModifierShift)
+	p.releaseMouse(x, y, input.MouseButtonMiddle, chromedp.ModifierShift)
+	if apple {
+		// The primary button with Shift on column 3 of row 3, then the middle one with Shift on column 6 of row 1.
+		s.waitForInput(t, []byte(mouseReport+"4;3;3M"))
+		s.waitForInput(t, []byte(mouseReport+"4;3;3m"))
+		s.waitForInput(t, []byte(mouseReport+"5;6;1M"))
+		s.waitForInput(t, []byte(mouseReport+"5;6;1m"))
+	}
+
+	// On macOS, Ctrl-click is the context menu's click.
+	p.clickCell(0, 5, chromedp.ModifierCtrl)
+
+	p.typeMarker(s, "after-the-clicks")
 	if opened := p.opened(); len(opened) != 0 {
 		t.Errorf("the page opened %q, want nothing", opened)
 	}
