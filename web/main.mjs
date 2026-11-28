@@ -1,3 +1,4 @@
+import { openLink } from "./links.mjs";
 import { openTerminal } from "./term.mjs";
 
 // The page waits for the font at least until this many milliseconds after it started loading.
@@ -120,7 +121,7 @@ try {
   show(`Couldn't load shelloe: ${err}`);
 }
 if (config !== undefined) {
-  terminal = openTerminal(element, fontFamily);
+  terminal = openTerminal(element, fontFamily, (uri) => openLink(uri, config.localhostURL));
   terminal.onInput((bytes) => session?.input(bytes));
   terminal.onResize((cols, rows) => session?.resize(cols, rows));
   connect();

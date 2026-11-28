@@ -317,6 +317,87 @@ func TestHandlerRefusesBadArguments(t *testing.T) {
 	})
 }
 
+func TestConfigHasTheLocalhostURLOnlyWhenItIsSet(t *testing.T) {
+	tests := []struct {
+		name         string
+		localhostURL string
+		want         string // the JSON of config.json's localhostURL; "" for no key
+	}{
+		{"set", "https://dev-{port}.example.com", `"https://dev-{port}.example.com"`},
+		{"empty", "", ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := validConfig(t)
+			config.LocalhostURL = test.localhostURL
+			handler, err := page.Handler(writeFiles(t, files), config, page.Font{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := httptest.NewServer(handler)
+			t.Cleanup(server.Close)
+
+			_, body := get(t, server, "GET", "/config.json", nil)
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(body, &fields); err != nil {
+				t.Fatal(err)
+			}
+			got, ok := fields["localhostURL"]
+			switch {
+			case test.want == "" && ok:
+				t.Errorf("config.json has the localhostURL %s, want none", got)
+			case test.want != "" && string(got) != test.want:
+				t.Errorf("config.json's localhostURL is %s, want %s", got, test.want)
+			}
+		})
+	}
+}
+
+func TestHandlerRefusesBadLocalhostURLs(t *testing.T) {
+	dir := writeFiles(t, files)
+	tests := []struct{ name, localhostURL string }{
+		{"no {port}", "https://dev.example.com"},
+		{"{port} twice", "https://{port}-{port}.example.com"},
+		{"a scheme other than http or https", "ftp://dev-{port}.example.com"},
+		{"no scheme", "dev-{port}.example.com"},
+		{"no // before the host", "https:dev-{port}.example.com"},
+		{"no host", "https:///{port}"},
+		{"a path of /", "https://dev-{port}.example.com/"},
+		{"a path", "https://dev-{port}.example.com/a"},
+		{"a query", "https://dev-{port}.example.com?q"},
+		{"a fragment", "https://dev-{port}.example.com#f"},
+		{"a bare ?", "https://dev-{port}.example.com?"},
+		{"a bare #", "https://dev-{port}.example.com#"},
+		{"a user", "https://user@dev-{port}.example.com"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := validConfig(t)
+			config.LocalhostURL = test.localhostURL
+			_, err := page.Handler(dir, config, page.Font{})
+			if err == nil {
+				t.Fatalf("Handler accepted the localhost URL %q", test.localhostURL)
+			}
+			if !strings.HasPrefix(err.Error(), "page: localhost URL: ") {
+				t.Errorf("error = %q, want it to start with %q", err, "page: localhost URL: ")
+			}
+		})
+	}
+}
+
+func TestHandlerAcceptsLocalhostURLsWithThePortInTheHost(t *testing.T) {
+	dir := writeFiles(t, files)
+	for _, localhostURL := range []string{"https://dev-{port}.example.com", "http://example.com:{port}"} {
+		t.Run(localhostURL, func(t *testing.T) {
+			config := validConfig(t)
+			config.LocalhostURL = localhostURL
+			if _, err := page.Handler(dir, config, page.Font{}); err != nil {
+				t.Errorf("Handler returned %v", err)
+			}
+		})
+	}
+}
+
 func TestHandlerFollowsSymlinks(t *testing.T) {
 	outside := writeFiles(t, map[string]string{"outside.mjs": "export const outside = 1;"})
 	real := writeFiles(t, map[string]string{"index.html": "x", "subdir/x.mjs": "x"})

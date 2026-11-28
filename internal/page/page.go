@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -43,12 +44,14 @@ var contentTypes = map[string]string{
 	".json": "application/json",
 }
 
-// Config is what the page needs to log in.
+// Config is what the page needs: how to log in, and where links to the
+// server's localhost go.
 type Config struct {
-	User    string `json:"user"`              // the user to log in as
-	Key     string `json:"key"`               // the security key's public key: an authorized_keys line that securitykey.ParseKey accepts
-	HostKey string `json:"hostKey"`           // the SSH server's host key, an authorized_keys line
-	Command string `json:"command,omitempty"` // the command to run instead of the login shell; "" runs the login shell
+	User         string `json:"user"`                   // the user to log in as
+	Key          string `json:"key"`                    // the security key's public key: an authorized_keys line that securitykey.ParseKey accepts
+	HostKey      string `json:"hostKey"`                // the SSH server's host key, an authorized_keys line
+	Command      string `json:"command,omitempty"`      // the command to run instead of the login shell; "" runs the login shell
+	LocalhostURL string `json:"localhostURL,omitempty"` // where the browser reaches the SSH server's localhost ports, with {port} for the port; "" opens links to localhost as they are
 }
 
 // Font is the terminal's typeface: a font file for each style.
@@ -111,6 +114,11 @@ func Handler(dir string, config Config, font Font) (http.Handler, error) {
 	if _, _, _, _, err := ssh.ParseAuthorizedKey([]byte(config.HostKey)); err != nil {
 		return nil, fmt.Errorf("page: host key: %w", err)
 	}
+	if config.LocalhostURL != "" {
+		if err := checkLocalhostURL(config.LocalhostURL); err != nil {
+			return nil, fmt.Errorf("page: localhost URL: %w", err)
+		}
+	}
 
 	files, err := loadFiles(dir)
 	if err != nil {
@@ -130,6 +138,39 @@ func Handler(dir string, config Config, font Font) (http.Handler, error) {
 		return nil, fmt.Errorf("page: %w", err)
 	}
 	return &handler{files: files, fonts: fonts, config: encoded}, nil
+}
+
+// checkLocalhostURL returns an error that says what's wrong with
+// localhostURL, or nil if it's an http or https URL with {port} once and
+// nothing after its host. The page appends a link's path, query and
+// fragment.
+func checkLocalhostURL(localhostURL string) error {
+	if n := strings.Count(localhostURL, "{port}"); n != 1 {
+		return fmt.Errorf("%q has {port} %d times, want once", localhostURL, n)
+	}
+	if strings.Contains(localhostURL, "?") {
+		return fmt.Errorf("%q has a ?; the link's query follows the host", localhostURL)
+	}
+	if strings.Contains(localhostURL, "#") {
+		return fmt.Errorf("%q has a #; the link's fragment follows the host", localhostURL)
+	}
+	u, err := url.Parse(strings.Replace(localhostURL, "{port}", "1", 1))
+	if err != nil {
+		return err
+	}
+	switch {
+	case u.Scheme != "http" && u.Scheme != "https":
+		return fmt.Errorf("%q isn't an http or https URL", localhostURL)
+	case u.Opaque != "":
+		return fmt.Errorf("%q has no // before its host", localhostURL)
+	case u.Host == "":
+		return fmt.Errorf("%q has no host", localhostURL)
+	case u.User != nil:
+		return fmt.Errorf("%q has a user", localhostURL)
+	case u.Path != "":
+		return fmt.Errorf("%q has a path, even /; the link's path follows the host", localhostURL)
+	}
+	return nil
 }
 
 // loadFont reads font's files, and returns them by the name each is served

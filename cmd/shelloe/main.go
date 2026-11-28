@@ -27,6 +27,7 @@ func main() {
 	boldFontFile := flag.String("font-bold", "", "font file for bold text; drawn from -font if unset")
 	italicFontFile := flag.String("font-italic", "", "font file for italic text; drawn from -font if unset")
 	boldItalicFontFile := flag.String("font-bold-italic", "", "font file for bold italic text; drawn from -font if unset")
+	localhostURL := flag.String("localhost-url", "", "URL where the browser reaches the SSH server's localhost ports, with {port} for the port, like https://dev-{port}.example.com; links to localhost open there instead")
 	flag.Parse()
 
 	if *target == "" || *origin == "" || *web == "" || *user == "" || *keyFile == "" || *hostKeyFile == "" {
@@ -53,10 +54,11 @@ func main() {
 	}
 
 	pageHandler, err := page.Handler(*web, page.Config{
-		User:    *user,
-		Key:     strings.TrimSpace(string(key)),
-		HostKey: strings.TrimSpace(string(hostKey)),
-		Command: *command,
+		User:         *user,
+		Key:          strings.TrimSpace(string(key)),
+		HostKey:      strings.TrimSpace(string(hostKey)),
+		Command:      *command,
+		LocalhostURL: *localhostURL,
 	}, page.Font{
 		Regular:    *fontFile,
 		Bold:       *boldFontFile,
