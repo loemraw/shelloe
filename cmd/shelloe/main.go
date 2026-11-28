@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/loemraw/shelloe/internal/page"
 	"github.com/loemraw/shelloe/internal/relay"
+	"github.com/loemraw/shelloe/internal/securitykey"
 )
 
 func main() {
@@ -20,7 +22,7 @@ func main() {
 	origin := flag.String("origin", "", "the web page's origin, like https://shell.example.com; WebSocket connections from any other origin are refused")
 	web := flag.String("web", "", "directory of the web page's files")
 	user := flag.String("user", "", "the user to log in as on the SSH server")
-	keyFile := flag.String("key", "", "file holding the security key's public key, an authorized_keys line")
+	keyFile := flag.String("key", "", "authorized_keys file holding the security key's public key: the key made in the browser for the -origin's host is used, and other lines are skipped")
 	hostKeyFile := flag.String("host-key", "", "file holding the SSH server's public host key, like /etc/ssh/ssh_host_ed25519_key.pub")
 	command := flag.String("command", "", "command to run instead of the login shell")
 	fontFile := flag.String("font", "", "font file for the terminal's text: WOFF2, WOFF, TrueType or OpenType; the system's monospace font if unset")
@@ -35,9 +37,21 @@ func main() {
 		os.Exit(2)
 	}
 
-	key, err := os.ReadFile(*keyFile)
+	originURL, err := url.Parse(*origin)
+	if err != nil || originURL.Hostname() == "" {
+		fmt.Fprintf(os.Stderr, "shelloe: -origin %q has no host\n", *origin)
+		os.Exit(2)
+	}
+	site := originURL.Hostname()
+
+	keys, err := os.ReadFile(*keyFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "shelloe: %v\n", err)
+		os.Exit(2)
+	}
+	key, err := securitykey.KeyForSite(keys, site)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "shelloe: %s: %v\n", *keyFile, err)
 		os.Exit(2)
 	}
 	hostKey, err := os.ReadFile(*hostKeyFile)
@@ -54,7 +68,7 @@ func main() {
 
 	pageHandler, err := page.Handler(*web, page.Config{
 		User:    *user,
-		Key:     strings.TrimSpace(string(key)),
+		Key:     key,
 		HostKey: strings.TrimSpace(string(hostKey)),
 		Command: *command,
 	}, page.Font{

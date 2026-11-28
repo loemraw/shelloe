@@ -21,6 +21,8 @@ go run ./cmd/shelloe -web web -target server:22 -origin https://shell.example.co
 
 To draw the terminal in your own typeface, add `-font` with its font file, and `-font-bold`, `-font-italic` and `-font-bold-italic` for those styles if you have them. WOFF2 files are the smallest. If the font hasn't arrived by the time the client has loaded, and at least a second has passed, that visit uses the system's monospace font; the browser keeps the font for the next visit.
 
+`-key` takes an authorized_keys file. The server uses the one key in it that was made in the browser for the page's site, the host of `-origin`, and skips every other line.
+
 The page must be served from the security key's site (its rpID), over HTTPS or on localhost.
 
 Run the tests with `go test ./...`. Tests that need sshd or Chrome skip unless `SHELLOE_SSHD` (an sshd binary) and `SHELLOE_CHROME` (a Chrome binary) are set. The browser tests need xterm.js fetched first.

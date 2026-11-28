@@ -108,6 +108,79 @@ func TestParseKeyComment(t *testing.T) {
 	}
 }
 
+func TestKeyForSitePicksTheSitesKey(t *testing.T) {
+	sshKeygenEd25519 := ssh.Marshal(struct {
+		Type        string
+		PublicKey   []byte
+		Application string
+	}{"sk-ssh-ed25519@openssh.com", make([]byte, 32), "ssh:"})
+	sshKeygenECDSA, err := securitykeytest.New("ssh:", "https://ssh.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := securitykeytest.New("other.example.com", "https://other.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mine := strings.TrimSpace(string(newAuthenticator(t).AuthorizedKey(canonicalType, "mine")))
+
+	var file []byte
+	file = append(file, "# comment\n\n"...)
+	file = append(file, "sk-ssh-ed25519@openssh.com "+base64.StdEncoding.EncodeToString(sshKeygenEd25519)+"\n"...)
+	file = append(file, sshKeygenECDSA.AuthorizedKey(canonicalType, "")...)
+	file = append(file, other.AuthorizedKey(canonicalType, "")...)
+	file = append(file, mine+"\r\n"...)
+
+	got, err := securitykey.KeyForSite(file, rpID)
+	if err != nil {
+		t.Fatalf("KeyForSite: %v", err)
+	}
+	if got != mine {
+		t.Errorf("KeyForSite = %q, want %q", got, mine)
+	}
+}
+
+func TestKeyForSiteRefuses(t *testing.T) {
+	sshKeygen, err := securitykeytest.New("ssh:", "https://ssh.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := securitykeytest.New("other.example.com", "https://other.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, second := newAuthenticator(t), newAuthenticator(t)
+
+	tests := []struct {
+		name    string
+		file    []byte
+		wantErr string
+	}{
+		{
+			"only other sites and ssh-keygen keys",
+			append(sshKeygen.AuthorizedKey(canonicalType, ""), other.AuthorizedKey(canonicalType, "")...),
+			"no key made in the browser for",
+		},
+		{
+			"two keys for the site",
+			append(first.AuthorizedKey(canonicalType, "one"), second.AuthorizedKey(canonicalType, "two")...),
+			"2 keys made in the browser for",
+		},
+		{"empty file", nil, "no key made in the browser for"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			line, err := securitykey.KeyForSite(test.file, rpID)
+			if err == nil {
+				t.Fatalf("KeyForSite = %q, want an error containing %q", line, test.wantErr)
+			}
+			if !strings.Contains(err.Error(), test.wantErr) {
+				t.Errorf("KeyForSite error = %q, want it to contain %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestParseKeyRejects(t *testing.T) {
 	fake := newAuthenticator(t)
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
