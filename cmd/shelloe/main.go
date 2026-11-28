@@ -22,7 +22,7 @@ func main() {
 	origin := flag.String("origin", "", "the web page's origin, like https://shell.example.com; WebSocket connections from any other origin are refused")
 	web := flag.String("web", "", "directory of the web page's files")
 	user := flag.String("user", "", "the user to log in as on the SSH server")
-	keyFile := flag.String("key", "", "authorized_keys file holding the security key's public key: the key made in the browser for the -origin's host is used, and other lines are skipped")
+	keyFile := flag.String("key", "", "authorized_keys file holding the security key's public key: the key made in the browser for the -origin's host (or a parent domain of it) is used, and other lines, and lines with options, are skipped")
 	hostKeyFile := flag.String("host-key", "", "file holding the SSH server's public host key, like /etc/ssh/ssh_host_ed25519_key.pub")
 	command := flag.String("command", "", "command to run instead of the login shell")
 	fontFile := flag.String("font", "", "font file for the terminal's text: WOFF2, WOFF, TrueType or OpenType; the system's monospace font if unset")

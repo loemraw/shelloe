@@ -140,6 +140,27 @@ func TestKeyForSitePicksTheSitesKey(t *testing.T) {
 	}
 }
 
+func TestKeyForSiteTakesAParentDomainsKey(t *testing.T) {
+	parent, err := securitykeytest.New("example.com", "https://example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	notParent, err := securitykeytest.New("ample.com", "https://ample.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.TrimSpace(string(parent.AuthorizedKey(canonicalType, "parent")))
+	file := append(notParent.AuthorizedKey(canonicalType, ""), parent.AuthorizedKey(canonicalType, "parent")...)
+
+	got, err := securitykey.KeyForSite(file, rpID)
+	if err != nil {
+		t.Fatalf("KeyForSite: %v", err)
+	}
+	if got != want {
+		t.Errorf("KeyForSite = %q, want %q", got, want)
+	}
+}
+
 func TestKeyForSiteRefuses(t *testing.T) {
 	sshKeygen, err := securitykeytest.New("ssh:", "https://ssh.invalid")
 	if err != nil {
@@ -150,6 +171,10 @@ func TestKeyForSiteRefuses(t *testing.T) {
 		t.Fatal(err)
 	}
 	first, second := newAuthenticator(t), newAuthenticator(t)
+	parent, err := securitykeytest.New("example.com", "https://example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	tests := []struct {
 		name    string
@@ -164,6 +189,11 @@ func TestKeyForSiteRefuses(t *testing.T) {
 		{
 			"two keys for the site",
 			append(first.AuthorizedKey(canonicalType, "one"), second.AuthorizedKey(canonicalType, "two")...),
+			"2 keys made in the browser for",
+		},
+		{
+			"a key for the site and one for its parent domain",
+			append(first.AuthorizedKey(canonicalType, ""), parent.AuthorizedKey(canonicalType, "")...),
 			"2 keys made in the browser for",
 		},
 		{"empty file", nil, "no key made in the browser for"},

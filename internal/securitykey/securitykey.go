@@ -127,9 +127,10 @@ func ParseKey(authorizedKeyLine []byte) (*Key, error) {
 }
 
 // KeyForSite returns the line of authorizedKeys, the contents of an authorized_keys file, that
-// holds the key made in the browser for rpID. It skips blank lines, comments, and lines that
-// ParseKey refuses or that hold another site's key, and fails unless exactly one line is left.
-func KeyForSite(authorizedKeys []byte, rpID string) (string, error) {
+// holds the key made in the browser for host or a parent domain of it, as WebAuthn allows. It skips
+// blank lines, comments, lines with options, and lines that ParseKey refuses or that hold another
+// site's key, and fails unless exactly one line is left.
+func KeyForSite(authorizedKeys []byte, host string) (string, error) {
 	var matches []string
 	for _, line := range strings.Split(string(authorizedKeys), "\n") {
 		line = strings.TrimSpace(line)
@@ -137,18 +138,18 @@ func KeyForSite(authorizedKeys []byte, rpID string) (string, error) {
 			continue
 		}
 		key, err := ParseKey([]byte(line))
-		if err != nil || key.RPID() != rpID {
+		if err != nil || (key.RPID() != host && !strings.HasSuffix(host, "."+key.RPID())) {
 			continue
 		}
 		matches = append(matches, line)
 	}
 	switch len(matches) {
 	case 0:
-		return "", fmt.Errorf("securitykey: no key made in the browser for %q", rpID)
+		return "", fmt.Errorf("securitykey: no key made in the browser for %q (lines with options are skipped)", host)
 	case 1:
 		return matches[0], nil
 	}
-	return "", fmt.Errorf("securitykey: %d keys made in the browser for %q, want one", len(matches), rpID)
+	return "", fmt.Errorf("securitykey: %d keys made in the browser for %q, want one", len(matches), host)
 }
 
 // cutField splits s at its first run of spaces or tabs.
